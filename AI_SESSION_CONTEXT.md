@@ -901,16 +901,20 @@ ALTER TABLE "feedback_comments"
   relationship types.
   ============================================================ -->
 
-```
+```text
 Node labels:
-- TODO
+- Station (通用標籤，所有車站節點皆具備)
+- Metro (捷運站專屬標籤，與 Station 搭配使用，例如 :Station:Metro)
+- NationalRail (國鐵站專屬標籤，與 Station 搭配使用，例如 :Station:NationalRail)
 
 Relationship types:
-- TODO
+- METRO_LINK (捷運站之間的相鄰連線)
+- RAIL_LINK (國鐵站之間的相鄰連線)
+- INTERCHANGE_TO (捷運與國鐵之間的站內轉乘連線)
 
 Key properties:
-- TODO
-```
+- Node properties: station_id (必須與 PostgreSQL 的 ID 完全一致), name, lines (適度冗餘，方便視覺化與除錯)
+- Edge properties: travel_time_min (計算最短路徑權重用), line (所屬路線名稱，支援計算最少換線次數等進階查詢)
 
 ## Function Signatures We Are Implementing
 
@@ -956,8 +960,14 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
+## Team Decisions Log
+
 - [ ] Schema design: TODO — add your table/column decisions here
-- [ ] Graph schema: TODO — add your node label and relationship type decisions here
+- [x] Graph schema:
+  - Decision: Node labels 採用多重標籤 (`:Station:Metro` / `:Station:NationalRail`)。 Why: 兼具全網搜尋彈性與單一路網查詢的高效能。
+  - Decision: Relationship types 明確區分連線 (`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`)。 Why: 限制特定路網查詢時（例如避開火車網路）效能極佳。
+  - Decision: Edge properties 儲存行車時間與路線 (`travel_time_min`, `line`)。 Why: 足以應付 Dijkstra 最短路徑演算法，且支援未來「最少換乘」等進階路徑計算。
+  - Decision: Node properties 採用適度冗餘 (`station_id`, `name`, `zone`)。 Why: 確保與 PostgreSQL 對齊的同時，在 Neo4j Browser 視覺化檢視時可直接看到站名，大幅提升除錯效率。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
