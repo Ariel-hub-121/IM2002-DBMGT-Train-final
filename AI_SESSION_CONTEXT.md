@@ -913,7 +913,7 @@ Relationship types:
 - INTERCHANGE_TO (捷運與國鐵之間的站內轉乘連線)
 
 Key properties:
-- Node properties: station_id (必須與 PostgreSQL 的 ID 完全一致), name, zone (適度冗餘，方便視覺化與除錯)
+- Node properties: station_id (必須與 PostgreSQL 的 ID 完全一致), name, lines (適度冗餘，方便視覺化與除錯)
 - Edge properties: travel_time_min (計算最短路徑權重用), line (所屬路線名稱，支援計算最少換線次數等進階查詢)
 
 ## Function Signatures We Are Implementing
