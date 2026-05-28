@@ -28,6 +28,7 @@ import string
 from datetime import datetime, timezone
 from typing import Optional
 
+import bcrypt
 import psycopg2
 import psycopg2.extras
 
@@ -271,7 +272,57 @@ def register_user(
     NOTE: passwords are stored as plain text here intentionally for teaching
     purposes. In production, replace with a salted hash (e.g. bcrypt).
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    import bcrypt, uuid
+
+    # Generate a unique user_id
+    user_id = "RU-" + str(uuid.uuid4())[:8].upper()
+
+    # Hash password with bcrypt — never store plain text
+    pw_salt = bcrypt.gensalt()
+    pw_hash = bcrypt.hashpw(password.encode(), pw_salt)
+
+    # Hash secret answer lowercase so comparison is case-insensitive
+    ans_salt = bcrypt.gensalt()
+    ans_hash = bcrypt.hashpw(secret_answer.lower().encode(), ans_salt)
+
+    # date_of_birth: only year_of_birth is provided, default to Jan 1
+    dob = f"{year_of_birth}-01-01"
+    full_name = f"{first_name} {surname}"
+
+    conn = _connect()
+    conn.autocommit = False  # manual transaction: both inserts must succeed together
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (user_id, full_name, email, date_of_birth)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, full_name, email, dob),
+            )
+            cur.execute(
+                """
+                INSERT INTO user_security
+                    (user_id, password_hash, password_salt,
+                     secret_question, secret_answer_hash, secret_answer_salt)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    pw_hash.decode(),
+                    pw_salt.decode(),
+                    secret_question,
+                    ans_hash.decode(),
+                    ans_salt.decode(),
+                ),
+            )
+        conn.commit()
+        return (True, user_id)
+    except Exception as e:
+        conn.rollback()
+        return (False, str(e))
+    finally:
+        conn.close()
 
 
 def login_user(email: str, password: str) -> Optional[dict]:
@@ -279,23 +330,116 @@ def login_user(email: str, password: str) -> Optional[dict]:
     Verify credentials. Returns a user dict on success or None on failure.
     Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    import bcrypt
+
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT u.user_id, u.email, u.full_name, u.phone,
+                       u.date_of_birth, u.is_active,
+                       us.password_hash
+                FROM users u
+                JOIN user_security us ON us.user_id = u.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    # Verify password against stored hash
+    if not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+        return None
+
+    # Split full_name back into first/surname for the required return shape
+    parts = (row["full_name"] or "").split(" ", 1)
+    return {
+        "user_id":       row["user_id"],
+        "email":         row["email"],
+        "full_name":     row["full_name"],
+        "first_name":    parts[0] if parts else "",
+        "surname":       parts[1] if len(parts) > 1 else "",
+        "phone":         row["phone"],
+        "date_of_birth": str(row["date_of_birth"]),
+        "is_active":     row["is_active"],
+    }
 
 
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT us.secret_question
+                FROM user_security us
+                JOIN users u ON u.user_id = us.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+    return row["secret_question"] if row else None
 
 
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    import bcrypt
+
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT us.secret_answer_hash
+                FROM user_security us
+                JOIN users u ON u.user_id = us.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+
+    if not row or not row["secret_answer_hash"]:
+        return False
+
+    # Lowercase input before comparing — matches how it was stored in register_user
+    return bcrypt.checkpw(answer.lower().encode(), row["secret_answer_hash"].encode())
 
 
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    import bcrypt
 
+    # Generate a fresh salt and hash for the new password
+    new_salt = bcrypt.gensalt()
+    new_hash = bcrypt.hashpw(new_password.encode(), new_salt)
+
+    conn = _connect()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE user_security
+                SET password_hash = %s,
+                    password_salt = %s
+                FROM users u
+                WHERE user_security.user_id = u.user_id
+                  AND u.email = %s
+                """,
+                (new_hash.decode(), new_salt.decode(), email),
+            )
+            updated = cur.rowcount
+        conn.commit()
+        return updated > 0
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
