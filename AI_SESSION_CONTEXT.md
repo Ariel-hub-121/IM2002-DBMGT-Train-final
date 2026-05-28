@@ -903,9 +903,13 @@ ALTER TABLE "feedback_comments"
 
 ```text
 Node labels:
-- Station (通用標籤，所有車站節點皆具備)
-- Metro (捷運站專屬標籤，與 Station 搭配使用，例如 :Station:Metro)
-- NationalRail (國鐵站專屬標籤，與 Station 搭配使用，例如 :Station:NationalRail)
+- Metro stations use multiple labels: :Station:Metro:MetroStation
+- National rail stations use multiple labels: :Station:NationalRail:NationalRailStation
+
+Reason:
+- :Station supports whole-network queries.
+- :Metro and :NationalRail follow our team graph schema.
+- :MetroStation and :NationalRailStation match the teacher guide terminology and static evaluation expectations.
 
 Relationship types:
 - METRO_LINK (捷運站之間的相鄰連線)
