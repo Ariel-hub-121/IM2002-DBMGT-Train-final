@@ -1194,8 +1194,6 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
-## Team Decisions Log
-
 - [ ] Schema design: TODO — add your table/column decisions here
 - [x] Graph schema:
   - Decision: Node labels 採用多重標籤 (`:Station:Metro` / `:Station:NationalRail`)。 Why: 兼具全網搜尋彈性與單一路網查詢的高效能。
@@ -1215,5 +1213,33 @@ TODO — add a prompt here after your schema design workshop
 
 ### Query implementation prompt that worked:
 ```
-TODO — add after implementing your first function
+I'm implementing a Python function for a PostgreSQL database project called TransitFlow.
+Follow these rules strictly:
+
+CODING CONVENTIONS:
+- Use only the table and column names in the schema below — do not invent names
+- Use the _connect() helper already defined in the module (returns a psycopg2 connection with autocommit=True)
+- Use psycopg2.extras.RealDictCursor so rows come back as dicts
+- Match the stub signature exactly — do not change parameter names, return type, or type hints
+- Return [] (not None) when no rows found, unless the return type is Optional[dict] — then return None
+- Use %s placeholders for all inputs — never f-strings or .format() inside SQL
+- Wrap the cursor in: with _connect() as conn: with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+- Return [dict(row) for row in cur.fetchall()] for list results, dict(cur.fetchone()) for single-row results
+- Do not add try/except unless the docstring explicitly asks for error handling
+- Do not import anything — all needed imports are already at the top of the module
+
+PROJECT CONTEXT:
+- Two networks: city metro (stations MS01–MS20, schedules MS_SCH01–MS_SCH08) and national rail (NR01–NR10, NR_SCH01–NR_SCH08)
+- All orders share a parent travel_orders table; national rail details live in bookings + booking_tickets; metro details live in metro_trip_purchases (+ metro_day_pass_trips for day passes)
+- Fare formula (both networks): total = base_fare_usd + (per_stop_rate_usd × stops_travelled)
+- booking_tickets.leg values: 'single', 'outbound', 'inbound'
+- booking_tickets.status values: 'confirmed', 'completed', 'cancelled'
+- travel_orders.status values: 'pending', 'confirmed', 'completed', 'cancelled'
+- metro_trip_purchases.ticket_type values: 'single', 'day_pass'
+
+STUB TO IMPLEMENT:
+[paste the full stub function including its docstring]
+
+SCHEMA (relevant tables only):
+[paste only the CREATE TABLE statements your function will query — trim the rest]
 ```
