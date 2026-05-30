@@ -926,6 +926,16 @@ Edge properties:
 - travel_time_min : 行車時間（分鐘），Dijkstra 最短路徑的權重；INTERCHANGE_TO 固定為 5（步行換乘假設值）
 - line            : 路線 ID（例如 "M1"），儲存於 METRO_LINK / RAIL_LINK；INTERCHANGE_TO 不儲存（轉乘非特定路線）
 
+METRO_LINK 額外 fare 屬性（由 metro_schedules.json 帶入，依路線不同）：
+- base_fare_usd     : 上車基本票價
+- per_stop_rate_usd : 每站增量票價
+
+RAIL_LINK 額外 fare 屬性（由 national_rail_schedules.json 帶入，依路線不同）：
+- standard_fare_usd          : 標準艙基本票價
+- standard_per_stop_rate_usd : 標準艙每站增量票價
+- first_fare_usd             : 頭等艙基本票價
+- first_per_stop_rate_usd    : 頭等艙每站增量票價
+
 Idempotency:
 - 所有節點與關係建立均使用 MERGE（不用 CREATE），重複執行不產生重複資料
 - 關係的 MERGE key 包含 line，確保同一對站點被不同路線共用時各自有獨立邊
@@ -934,6 +944,7 @@ Directionality:
 - 所有關係雙向儲存（A→B 與 B→A）
 - METRO_LINK / RAIL_LINK：JSON 鄰接表本身對稱，迴圈自然產生雙向
 - INTERCHANGE_TO：需各自執行兩次 session.run（metro→rail 與 rail→metro）
+```
 
 ## Function Signatures We Are Implementing
 
