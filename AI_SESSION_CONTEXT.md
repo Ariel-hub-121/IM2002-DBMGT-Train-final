@@ -902,19 +902,38 @@ ALTER TABLE "feedback_comments"
   ============================================================ -->
 
 ```text
-Node labels:
-- Station (通用標籤，所有車站節點皆具備)
-- Metro (捷運站專屬標籤，與 Station 搭配使用，例如 :Station:Metro)
-- NationalRail (國鐵站專屬標籤，與 Station 搭配使用，例如 :Station:NationalRail)
+Node labels (triple-label pattern):
+- :Station:Metro:MetroStation
+    :Station      — 全網查詢（跨路網）
+    :Metro        — 僅捷運查詢
+    :MetroStation — 對應教師評分規範的標籤名稱
+- :Station:NationalRail:NationalRailStation
+    :Station             — 全網查詢
+    :NationalRail        — 僅國鐵查詢
+    :NationalRailStation — 對應教師評分規範的標籤名稱
 
 Relationship types:
-- METRO_LINK (捷運站之間的相鄰連線)
-- RAIL_LINK (國鐵站之間的相鄰連線)
-- INTERCHANGE_TO (捷運與國鐵之間的站內轉乘連線)
+- METRO_LINK     (捷運站之間的相鄰連線，雙向儲存)
+- RAIL_LINK      (國鐵站之間的相鄰連線，雙向儲存)
+- INTERCHANGE_TO (捷運↔國鐵站內轉乘，雙向儲存；A→B 與 B→A 各為獨立一條邊)
 
-Key properties:
-- Node properties: station_id (必須與 PostgreSQL 的 ID 完全一致), name, lines (適度冗餘，方便視覺化與除錯)
-- Edge properties: travel_time_min (計算最短路徑權重用), line (所屬路線名稱，支援計算最少換線次數等進階查詢)
+Node properties:
+- station_id : 與 PostgreSQL PK 完全一致（例如 "MS01"），跨資料庫查詢的關鍵
+- name       : 人可讀站名，方便 Neo4j Browser 視覺化與除錯
+- lines      : 路線 ID 陣列（例如 ["M1","M2"]），原生 Neo4j list，可用 "M1" IN s.lines 過濾
+
+Edge properties:
+- travel_time_min : 行車時間（分鐘），Dijkstra 最短路徑的權重；INTERCHANGE_TO 固定為 5（步行換乘假設值）
+- line            : 路線 ID（例如 "M1"），儲存於 METRO_LINK / RAIL_LINK；INTERCHANGE_TO 不儲存（轉乘非特定路線）
+
+Idempotency:
+- 所有節點與關係建立均使用 MERGE（不用 CREATE），重複執行不產生重複資料
+- 關係的 MERGE key 包含 line，確保同一對站點被不同路線共用時各自有獨立邊
+
+Directionality:
+- 所有關係雙向儲存（A→B 與 B→A）
+- METRO_LINK / RAIL_LINK：JSON 鄰接表本身對稱，迴圈自然產生雙向
+- INTERCHANGE_TO：需各自執行兩次 session.run（metro→rail 與 rail→metro）
 
 ## Function Signatures We Are Implementing
 
@@ -963,11 +982,12 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 ## Team Decisions Log
 
 - [ ] Schema design: TODO — add your table/column decisions here
-- [x] Graph schema:
-  - Decision: Node labels 採用多重標籤 (`:Station:Metro` / `:Station:NationalRail`)。 Why: 兼具全網搜尋彈性與單一路網查詢的高效能。
-  - Decision: Relationship types 明確區分連線 (`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`)。 Why: 限制特定路網查詢時（例如避開火車網路）效能極佳。
-  - Decision: Edge properties 儲存行車時間與路線 (`travel_time_min`, `line`)。 Why: 足以應付 Dijkstra 最短路徑演算法，且支援未來「最少換乘」等進階路徑計算。
-  - Decision: Node properties 採用適度冗餘 (`station_id`, `name`, `zone`)。 Why: 確保與 PostgreSQL 對齊的同時，在 Neo4j Browser 視覺化檢視時可直接看到站名，大幅提升除錯效率。
+- [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-30):
+  - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
+  - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
+  - Decision: Edge properties — `travel_time_min`（Dijkstra 權重）+ `line`（路線 ID，僅 METRO_LINK/RAIL_LINK）。INTERCHANGE_TO 不儲存 line，固定 travel_time_min=5。 Why: line 加入 MERGE key 以防兩線共用同一對站點時邊互相覆蓋；INTERCHANGE_TO 為步行換乘，不屬於任何路線。
+  - Decision: Node properties 為 `station_id`（與 PostgreSQL PK 完全一致）、`name`、`lines`（原生 Neo4j 陣列）。 Why: station_id 對齊保證跨資料庫查詢正確；lines 存為陣列可用 "M1" IN s.lines 高效過濾。
+  - Decision: 全部使用 MERGE 不用 CREATE（idempotent）。 Why: 開發期間會多次重新 seed，MERGE 確保安全重跑。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
