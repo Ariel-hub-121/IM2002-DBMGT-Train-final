@@ -33,11 +33,24 @@ Graph schema used in this seeder:
                   "M1" IN s.lines for efficient filtering
 
   Edge properties stored:
-    travel_time_min — numeric weight used by Dijkstra shortest-path queries
-    line            — line ID (e.g. "M1") stored on METRO_LINK / RAIL_LINK
-                      edges so that queries can filter to a single line or
-                      calculate minimum-transfers routes; omitted on
-                      INTERCHANGE_TO because the transfer is not line-specific
+    METRO_LINK:
+      travel_time_min     — numeric weight used by Dijkstra shortest-path queries
+      line                — line ID (e.g. "M1"); omitted on INTERCHANGE_TO
+      base_fare_usd       — flat boarding charge for this line
+      per_stop_rate_usd   — incremental fare per stop
+
+    RAIL_LINK:
+      travel_time_min            — numeric weight used by Dijkstra shortest-path queries
+      line                       — line ID (e.g. "NR1")
+      standard_fare_usd          — standard class base fare
+      standard_per_stop_rate_usd — standard class per-stop rate
+      first_fare_usd             — first class base fare
+      first_per_stop_rate_usd    — first class per-stop rate
+
+    INTERCHANGE_TO:
+      travel_time_min = 5  — fixed assumed walking time between platforms
+                             (no source data provides a measured value);
+                             no line property since the transfer is not line-specific
 
   Idempotency:
     All node and relationship creation uses MERGE, never CREATE.
@@ -89,6 +102,30 @@ def _load(filename: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Constraint / index setup
+# ---------------------------------------------------------------------------
+
+def _create_constraints(session) -> None:
+    """Create uniqueness constraints on station_id for both node types.
+
+    Constraints serve double duty: they enforce data integrity (no duplicate
+    station_ids) and implicitly create a B-tree index, which makes every
+    MERGE (n { station_id: $id }) an O(log n) lookup instead of a full scan.
+
+    IF NOT EXISTS means re-running is safe even if constraints already exist.
+    """
+    session.run(
+        "CREATE CONSTRAINT metro_station_id_unique IF NOT EXISTS "
+        "FOR (s:MetroStation) REQUIRE s.station_id IS UNIQUE"
+    ).consume()
+    session.run(
+        "CREATE CONSTRAINT rail_station_id_unique IF NOT EXISTS "
+        "FOR (s:NationalRailStation) REQUIRE s.station_id IS UNIQUE"
+    ).consume()
+    print("  Done — uniqueness constraints ready.")
+
+
+# ---------------------------------------------------------------------------
 # Node creation helpers
 # ---------------------------------------------------------------------------
 
@@ -99,8 +136,8 @@ def _create_metro_stations(session, metro_stations: list[dict]) -> None:
     matched by network-agnostic queries (:Station), metro-only queries
     (:Metro), and the teacher-specified label (:MetroStation).
 
-    Uses MERGE on station_id so re-running is safe (idempotent).
-    SET overwrites name and lines on every run so data stays fresh.
+    Uses UNWIND to send all stations in a single round-trip, then MERGE on
+    station_id so re-running is safe (idempotent).
 
     Args:
         session: An active Neo4j driver session.
@@ -108,22 +145,18 @@ def _create_metro_stations(session, metro_stations: list[dict]) -> None:
     """
     print(f"  Creating {len(metro_stations)} metro station nodes...")
 
-    for station in metro_stations:
-        # MERGE finds an existing :MetroStation node with this station_id,
-        # or creates a new one if none exists.
-        # We MERGE on station_id alone (the natural unique key) and then SET
-        # the remaining properties, which is the recommended Neo4j pattern for
-        # idempotent upserts.
-        session.run(
-            """
-            MERGE (s:Station:Metro:MetroStation { station_id: $station_id })
-            SET s.name  = $name,
-                s.lines = $lines
-            """,
-            station_id=station["station_id"],
-            name=station["name"],
-            lines=station["lines"],   # stored as a native Neo4j list property
-        )
+    session.run(
+        """
+        UNWIND $stations AS s
+        MERGE (n:Station:Metro:MetroStation { station_id: s.station_id })
+        SET n.name  = s.name,
+            n.lines = s.lines
+        """,
+        stations=[
+            {"station_id": st["station_id"], "name": st["name"], "lines": st["lines"]}
+            for st in metro_stations
+        ],
+    ).consume()
 
     print(f"    Done — {len(metro_stations)} metro station nodes ready.")
 
@@ -140,17 +173,18 @@ def _create_rail_stations(session, rail_stations: list[dict]) -> None:
     """
     print(f"  Creating {len(rail_stations)} national rail station nodes...")
 
-    for station in rail_stations:
-        session.run(
-            """
-            MERGE (s:Station:NationalRail:NationalRailStation { station_id: $station_id })
-            SET s.name  = $name,
-                s.lines = $lines
-            """,
-            station_id=station["station_id"],
-            name=station["name"],
-            lines=station["lines"],
-        )
+    session.run(
+        """
+        UNWIND $stations AS s
+        MERGE (n:Station:NationalRail:NationalRailStation { station_id: s.station_id })
+        SET n.name  = s.name,
+            n.lines = s.lines
+        """,
+        stations=[
+            {"station_id": st["station_id"], "name": st["name"], "lines": st["lines"]}
+            for st in rail_stations
+        ],
+    ).consume()
 
     print(f"    Done — {len(rail_stations)} national rail station nodes ready.")
 
@@ -177,40 +211,38 @@ def _create_metro_links(session, metro_stations: list[dict], metro_fare_by_line:
         metro_stations: Parsed list from metro_stations.json.
         metro_fare_by_line: Mapping of line ID → fare dict built from metro_schedules.json.
     """
-    link_count = 0
-
     print("  Creating METRO_LINK relationships...")
 
+    rows = []
     for station in metro_stations:
         for adj in station["adjacent_stations"]:
-            # MATCH both endpoint nodes first — they must already exist
-            # (created in _create_metro_stations above).
-            # MERGE the directed edge (origin → destination) keyed on line.
-            # Then SET the remaining property (travel_time_min).
-            # Separating the MERGE key from SET is the correct Neo4j idiom:
-            # properties in the MERGE pattern are used for matching only;
-            # SET updates them after match-or-create.
             fare = metro_fare_by_line.get(adj["line"], {})
-            session.run(
-                """
-                MATCH (a:MetroStation { station_id: $origin_id })
-                MATCH (b:MetroStation { station_id: $dest_id })
-                MERGE (a)-[r:METRO_LINK { line: $line }]->(b)
-                SET r.travel_time_min = $travel_time_min,
-                    r.per_stop_rate_usd = $per_stop_rate_usd
-                """,
-                origin_id=station["station_id"],
-                dest_id=adj["station_id"],
-                line=adj["line"],
-                travel_time_min=adj["travel_time_min"],
-                per_stop_rate_usd=fare.get("per_stop_rate_usd"),
-            )
-            link_count += 1
+            rows.append({
+                "origin_id": station["station_id"],
+                "dest_id": adj["station_id"],
+                "line": adj["line"],
+                "travel_time_min": adj["travel_time_min"],
+                "base_fare_usd": fare.get("base_fare_usd"),
+                "per_stop_rate_usd": fare.get("per_stop_rate_usd"),
+            })
+
+    session.run(
+        """
+        UNWIND $rows AS row
+        MATCH (a:MetroStation { station_id: row.origin_id })
+        MATCH (b:MetroStation { station_id: row.dest_id })
+        MERGE (a)-[r:METRO_LINK { line: row.line }]->(b)
+        SET r.travel_time_min   = row.travel_time_min,
+            r.base_fare_usd     = row.base_fare_usd,
+            r.per_stop_rate_usd = row.per_stop_rate_usd
+        """,
+        rows=rows,
+    ).consume()
 
     # Because every station lists its neighbours and metro_stations.json is
     # symmetric, the loop above creates edges in both directions naturally.
     # (e.g. MS01 lists MS02 as a neighbour AND MS02 lists MS01 as a neighbour)
-    print(f"    Done — {link_count} METRO_LINK relationships ready.")
+    print(f"    Done — {len(rows)} METRO_LINK relationships ready.")
 
 
 def _create_rail_links(session, rail_stations: list[dict], rail_fare_by_line: dict) -> None:
@@ -224,32 +256,39 @@ def _create_rail_links(session, rail_stations: list[dict], rail_fare_by_line: di
         rail_stations: Parsed list from national_rail_stations.json.
         rail_fare_by_line: Mapping of line ID → fare dict built from national_rail_schedules.json.
     """
-    link_count = 0
-
     print("  Creating RAIL_LINK relationships...")
 
+    rows = []
     for station in rail_stations:
         for adj in station["adjacent_stations"]:
             fare = rail_fare_by_line.get(adj["line"], {})
-            session.run(
-                """
-                MATCH (a:NationalRailStation { station_id: $origin_id })
-                MATCH (b:NationalRailStation { station_id: $dest_id })
-                MERGE (a)-[r:RAIL_LINK { line: $line }]->(b)
-                SET r.travel_time_min = $travel_time_min,
-                    r.standard_fare_usd = $standard_fare_usd,
-                    r.first_fare_usd = $first_fare_usd
-                """,
-                origin_id=station["station_id"],
-                dest_id=adj["station_id"],
-                line=adj["line"],
-                travel_time_min=adj["travel_time_min"],
-                standard_fare_usd=fare.get("standard_fare_usd"),
-                first_fare_usd=fare.get("first_fare_usd"),
-            )
-            link_count += 1
+            rows.append({
+                "origin_id": station["station_id"],
+                "dest_id": adj["station_id"],
+                "line": adj["line"],
+                "travel_time_min": adj["travel_time_min"],
+                "standard_fare_usd": fare.get("standard_fare_usd"),
+                "standard_per_stop_rate_usd": fare.get("standard_per_stop_rate_usd"),
+                "first_fare_usd": fare.get("first_fare_usd"),
+                "first_per_stop_rate_usd": fare.get("first_per_stop_rate_usd"),
+            })
 
-    print(f"    Done — {link_count} RAIL_LINK relationships ready.")
+    session.run(
+        """
+        UNWIND $rows AS row
+        MATCH (a:NationalRailStation { station_id: row.origin_id })
+        MATCH (b:NationalRailStation { station_id: row.dest_id })
+        MERGE (a)-[r:RAIL_LINK { line: row.line }]->(b)
+        SET r.travel_time_min            = row.travel_time_min,
+            r.standard_fare_usd          = row.standard_fare_usd,
+            r.standard_per_stop_rate_usd = row.standard_per_stop_rate_usd,
+            r.first_fare_usd             = row.first_fare_usd,
+            r.first_per_stop_rate_usd    = row.first_per_stop_rate_usd
+        """,
+        rows=rows,
+    ).consume()
+
+    print(f"    Done — {len(rows)} RAIL_LINK relationships ready.")
 
 
 def _create_interchange_links(session, metro_stations: list[dict]) -> None:
@@ -275,57 +314,47 @@ def _create_interchange_links(session, metro_stations: list[dict]) -> None:
         metro_stations: Parsed list from metro_stations.json (interchange
             flags and paired rail station IDs come from this file).
     """
-    interchange_count = 0
-
     print("  Creating INTERCHANGE_TO relationships...")
 
+    rows = []
     for station in metro_stations:
-        # Only process stations that are flagged as having a rail interchange
         if not station.get("is_interchange_national_rail"):
             continue
-
-        rail_station_id = station.get("interchange_national_rail_station_id")
-        if not rail_station_id:
-            # Defensive guard: flag is true but no target ID — skip silently
+        rail_id = station.get("interchange_national_rail_station_id")
+        if not rail_id:
             print(f"    WARNING: {station['station_id']} flagged as interchange "
                   f"but interchange_national_rail_station_id is missing — skipping.")
             continue
-
-        # Metro → National Rail direction
-        # MERGE ensures re-seeding does not create duplicate interchange edges.
-        session.run(
-            """
-            MATCH (metro:MetroStation { station_id: $metro_id })
-            MATCH (rail:NationalRailStation { station_id: $rail_id })
-            MERGE (metro)-[r:INTERCHANGE_TO]->(rail)
-            SET r.travel_time_min = $travel_time_min
-            """,
-            metro_id=station["station_id"],
-            rail_id=rail_station_id,
-            travel_time_min=5,
-        )
-
-        # National Rail → Metro direction (reverse of the above)
-        # Storing both directions allows Dijkstra to traverse the interchange
-        # regardless of which network the journey starts on.
-        session.run(
-            """
-            MATCH (rail:NationalRailStation { station_id: $rail_id })
-            MATCH (metro:MetroStation { station_id: $metro_id })
-            MERGE (rail)-[r:INTERCHANGE_TO]->(metro)
-            SET r.travel_time_min = $travel_time_min
-            """,
-            rail_id=rail_station_id,
-            metro_id=station["station_id"],
-            travel_time_min=5,
-        )
-
-        interchange_count += 1
+        rows.append({"metro_id": station["station_id"], "rail_id": rail_id})
         print(f"    Interchange: {station['station_id']} ({station['name']}) "
-              f"↔ {rail_station_id}")
+              f"↔ {rail_id}")
 
-    print(f"    Done — {interchange_count} interchange station(s), "
-          f"{interchange_count * 2} INTERCHANGE_TO relationships ready.")
+    # Metro → National Rail
+    session.run(
+        """
+        UNWIND $rows AS row
+        MATCH (metro:MetroStation { station_id: row.metro_id })
+        MATCH (rail:NationalRailStation { station_id: row.rail_id })
+        MERGE (metro)-[r:INTERCHANGE_TO]->(rail)
+        SET r.travel_time_min = 5
+        """,
+        rows=rows,
+    ).consume()
+
+    # National Rail → Metro (reverse direction)
+    session.run(
+        """
+        UNWIND $rows AS row
+        MATCH (rail:NationalRailStation { station_id: row.rail_id })
+        MATCH (metro:MetroStation { station_id: row.metro_id })
+        MERGE (rail)-[r:INTERCHANGE_TO]->(metro)
+        SET r.travel_time_min = 5
+        """,
+        rows=rows,
+    ).consume()
+
+    print(f"    Done — {len(rows)} interchange station(s), "
+          f"{len(rows) * 2} INTERCHANGE_TO relationships ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +366,16 @@ def seed() -> None:
 
     Execution order matters:
       1. Load JSON source data
-      2. Clear existing graph (DETACH DELETE removes nodes + their relationships)
-      3. Create all metro station nodes
-      4. Create all national rail station nodes
-      5. Create METRO_LINK edges  (nodes must exist first)
-      6. Create RAIL_LINK edges   (nodes must exist first)
-      7. Create INTERCHANGE_TO edges (both node types must exist first)
+      2. Create uniqueness constraints (also creates indexes for fast MERGE)
+      3. Clear existing graph (DETACH DELETE removes nodes + their relationships)
+      4. Create all metro station nodes
+      5. Create all national rail station nodes
+      6. Create METRO_LINK edges  (nodes must exist first)
+      7. Create RAIL_LINK edges   (nodes must exist first)
+      8. Create INTERCHANGE_TO edges (both node types must exist first)
 
-    Steps 5–7 use MATCH to find nodes, so they will silently produce no
-    relationships if the corresponding nodes were not created in steps 3–4.
+    Steps 6–8 use MATCH to find nodes, so they will silently produce no
+    relationships if the corresponding nodes were not created in steps 4–5.
     """
     print("\nLoading source data from train-mock-data/...")
     metro_stations   = _load("metro_stations.json")
@@ -370,47 +400,52 @@ def seed() -> None:
         if line not in rail_fare_by_line:
             rail_fare_by_line[line] = {
                 "standard_fare_usd": sch["fare_classes"]["standard"]["base_fare_usd"],
+                "standard_per_stop_rate_usd": sch["fare_classes"]["standard"]["per_stop_rate_usd"],
                 "first_fare_usd": sch["fare_classes"]["first"]["base_fare_usd"],
+                "first_per_stop_rate_usd": sch["fare_classes"]["first"]["per_stop_rate_usd"],
             }
 
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
+        with driver.session() as session:
 
-    with driver.session() as session:
+            # ------------------------------------------------------------------
+            # Step 1: Create constraints / indexes
+            # ------------------------------------------------------------------
+            print("\nCreating constraints...")
+            _create_constraints(session)
 
-        # ------------------------------------------------------------------
-        # Step 1: Clear existing data
-        # ------------------------------------------------------------------
-        # DETACH DELETE removes all nodes AND their relationships in one pass.
-        # Without DETACH, Neo4j raises an error if a node still has
-        # relationships attached when you try to delete it.
-        print("\nClearing existing graph data...")
-        session.run("MATCH (n) DETACH DELETE n")
-        print("  Done — graph is empty.")
+            # ------------------------------------------------------------------
+            # Step 2: Clear existing data
+            # ------------------------------------------------------------------
+            # DETACH DELETE removes all nodes AND their relationships in one pass.
+            # Without DETACH, Neo4j raises an error if a node still has
+            # relationships attached when you try to delete it.
+            print("\nClearing existing graph data...")
+            session.run("MATCH (n) DETACH DELETE n").consume()
+            print("  Done — graph is empty.")
 
-        # ------------------------------------------------------------------
-        # Step 2: Create nodes
-        # ------------------------------------------------------------------
-        # Nodes must be created before any relationship creation step,
-        # because the MATCH clauses in the relationship queries rely on the
-        # nodes already existing.
-        print("\nCreating station nodes...")
-        _create_metro_stations(session, metro_stations)
-        _create_rail_stations(session, rail_stations)
+            # ------------------------------------------------------------------
+            # Step 3: Create nodes
+            # ------------------------------------------------------------------
+            # Nodes must be created before any relationship creation step,
+            # because the MATCH clauses in the relationship queries rely on the
+            # nodes already existing.
+            print("\nCreating station nodes...")
+            _create_metro_stations(session, metro_stations)
+            _create_rail_stations(session, rail_stations)
 
-        # ------------------------------------------------------------------
-        # Step 3: Create intra-network relationships
-        # ------------------------------------------------------------------
-        print("\nCreating intra-network relationships...")
-        _create_metro_links(session, metro_stations, metro_fare_by_line)
-        _create_rail_links(session, rail_stations, rail_fare_by_line)
+            # ------------------------------------------------------------------
+            # Step 4: Create intra-network relationships
+            # ------------------------------------------------------------------
+            print("\nCreating intra-network relationships...")
+            _create_metro_links(session, metro_stations, metro_fare_by_line)
+            _create_rail_links(session, rail_stations, rail_fare_by_line)
 
-        # ------------------------------------------------------------------
-        # Step 4: Create cross-network interchange relationships
-        # ------------------------------------------------------------------
-        print("\nCreating cross-network interchange relationships...")
-        _create_interchange_links(session, metro_stations)
-
-    driver.close()
+            # ------------------------------------------------------------------
+            # Step 5: Create cross-network interchange relationships
+            # ------------------------------------------------------------------
+            print("\nCreating cross-network interchange relationships...")
+            _create_interchange_links(session, metro_stations)
 
     print("\n" + "=" * 60)
     print("Neo4j graph seeded successfully.")
