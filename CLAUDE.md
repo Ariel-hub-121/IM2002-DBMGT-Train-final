@@ -107,6 +107,11 @@ Configured via `.env` (copy from `.env.example`). Two options:
 
 All mock data lives in `train-mock-data/` as JSON files. Study these before designing schemas — they define the shape and relationships of stations, schedules, seat layouts, users, bookings, and policy documents.
 
+## Git & GitHub
+
+- **Target repository for all PRs:** `Ariel-hub-121/IM2002-DBMGT-Train-final` (not the upstream `NCUIM-Lab710-Teaching` org)
+- Always use `--repo Ariel-hub-121/IM2002-DBMGT-Train-final` when running `gh pr create`
+
 ## Team Coordination Rules
 
 - **Schema-first:** agree on and commit `databases/relational/schema.sql` before any teammate implements query functions
