@@ -159,7 +159,7 @@ def _create_rail_stations(session, rail_stations: list[dict]) -> None:
 # Relationship creation helpers
 # ---------------------------------------------------------------------------
 
-def _create_metro_links(session, metro_stations: list[dict]) -> None:
+def _create_metro_links(session, metro_stations: list[dict], metro_fare_by_line: dict) -> None:
     """Create bidirectional METRO_LINK relationships between adjacent metro stations.
 
     Source of truth: the adjacent_stations list on each station entry in
@@ -175,6 +175,7 @@ def _create_metro_links(session, metro_stations: list[dict]) -> None:
     Args:
         session: An active Neo4j driver session.
         metro_stations: Parsed list from metro_stations.json.
+        metro_fare_by_line: Mapping of line ID → fare dict built from metro_schedules.json.
     """
     link_count = 0
 
@@ -189,17 +190,20 @@ def _create_metro_links(session, metro_stations: list[dict]) -> None:
             # Separating the MERGE key from SET is the correct Neo4j idiom:
             # properties in the MERGE pattern are used for matching only;
             # SET updates them after match-or-create.
+            fare = metro_fare_by_line.get(adj["line"], {})
             session.run(
                 """
                 MATCH (a:MetroStation { station_id: $origin_id })
                 MATCH (b:MetroStation { station_id: $dest_id })
                 MERGE (a)-[r:METRO_LINK { line: $line }]->(b)
-                SET r.travel_time_min = $travel_time_min
+                SET r.travel_time_min = $travel_time_min,
+                    r.per_stop_rate_usd = $per_stop_rate_usd
                 """,
                 origin_id=station["station_id"],
                 dest_id=adj["station_id"],
                 line=adj["line"],
                 travel_time_min=adj["travel_time_min"],
+                per_stop_rate_usd=fare.get("per_stop_rate_usd"),
             )
             link_count += 1
 
@@ -209,7 +213,7 @@ def _create_metro_links(session, metro_stations: list[dict]) -> None:
     print(f"    Done — {link_count} METRO_LINK relationships ready.")
 
 
-def _create_rail_links(session, rail_stations: list[dict]) -> None:
+def _create_rail_links(session, rail_stations: list[dict], rail_fare_by_line: dict) -> None:
     """Create bidirectional RAIL_LINK relationships between adjacent national rail stations.
 
     Identical logic to _create_metro_links but targets :NationalRailStation
@@ -218,6 +222,7 @@ def _create_rail_links(session, rail_stations: list[dict]) -> None:
     Args:
         session: An active Neo4j driver session.
         rail_stations: Parsed list from national_rail_stations.json.
+        rail_fare_by_line: Mapping of line ID → fare dict built from national_rail_schedules.json.
     """
     link_count = 0
 
@@ -225,17 +230,22 @@ def _create_rail_links(session, rail_stations: list[dict]) -> None:
 
     for station in rail_stations:
         for adj in station["adjacent_stations"]:
+            fare = rail_fare_by_line.get(adj["line"], {})
             session.run(
                 """
                 MATCH (a:NationalRailStation { station_id: $origin_id })
                 MATCH (b:NationalRailStation { station_id: $dest_id })
                 MERGE (a)-[r:RAIL_LINK { line: $line }]->(b)
-                SET r.travel_time_min = $travel_time_min
+                SET r.travel_time_min = $travel_time_min,
+                    r.standard_fare_usd = $standard_fare_usd,
+                    r.first_fare_usd = $first_fare_usd
                 """,
                 origin_id=station["station_id"],
                 dest_id=adj["station_id"],
                 line=adj["line"],
                 travel_time_min=adj["travel_time_min"],
+                standard_fare_usd=fare.get("standard_fare_usd"),
+                first_fare_usd=fare.get("first_fare_usd"),
             )
             link_count += 1
 
@@ -338,10 +348,30 @@ def seed() -> None:
     relationships if the corresponding nodes were not created in steps 3–4.
     """
     print("\nLoading source data from train-mock-data/...")
-    metro_stations = _load("metro_stations.json")
-    rail_stations  = _load("national_rail_stations.json")
+    metro_stations   = _load("metro_stations.json")
+    rail_stations    = _load("national_rail_stations.json")
+    metro_schedules  = _load("metro_schedules.json")
+    rail_schedules   = _load("national_rail_schedules.json")
     print(f"  Loaded {len(metro_stations)} metro stations, "
           f"{len(rail_stations)} national rail stations.")
+
+    metro_fare_by_line: dict = {}
+    for sch in metro_schedules:
+        line = sch["line"]
+        if line not in metro_fare_by_line:
+            metro_fare_by_line[line] = {
+                "base_fare_usd": sch["base_fare_usd"],
+                "per_stop_rate_usd": sch["per_stop_rate_usd"],
+            }
+
+    rail_fare_by_line: dict = {}
+    for sch in rail_schedules:
+        line = sch["line"]
+        if line not in rail_fare_by_line:
+            rail_fare_by_line[line] = {
+                "standard_fare_usd": sch["fare_classes"]["standard"]["base_fare_usd"],
+                "first_fare_usd": sch["fare_classes"]["first"]["base_fare_usd"],
+            }
 
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
@@ -371,8 +401,8 @@ def seed() -> None:
         # Step 3: Create intra-network relationships
         # ------------------------------------------------------------------
         print("\nCreating intra-network relationships...")
-        _create_metro_links(session, metro_stations)
-        _create_rail_links(session, rail_stations)
+        _create_metro_links(session, metro_stations, metro_fare_by_line)
+        _create_rail_links(session, rail_stations, rail_fare_by_line)
 
         # ------------------------------------------------------------------
         # Step 4: Create cross-network interchange relationships
