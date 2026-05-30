@@ -1164,10 +1164,15 @@ METRO_LINK 額外 fare 屬性（由 metro_schedules.json 帶入，依路線不�
 - per_stop_rate_usd : 每站增量票價
 
 RAIL_LINK 額外 fare 屬性（由 national_rail_schedules.json 帶入，依路線不同）：
-- standard_fare_usd          : 標準艙基本票價
-- standard_per_stop_rate_usd : 標準艙每站增量票價
-- first_fare_usd             : 頭等艙基本票價
-- first_per_stop_rate_usd    : 頭等艙每站增量票價
+國鐵有 normal / express 兩種 service_type，各自有 standard / first 兩種艙等，因此每條邊儲存 8 個 fare 欄位：
+- normal_standard_fare_usd          : 普通車、標準艙基本票價
+- normal_standard_per_stop_rate_usd : 普通車、標準艙每站增量票價
+- normal_first_fare_usd             : 普通車、頭等艙基本票價
+- normal_first_per_stop_rate_usd    : 普通車、頭等艙每站增量票價
+- express_standard_fare_usd          : 快車、標準艙基本票價
+- express_standard_per_stop_rate_usd : 快車、標準艙每站增量票價
+- express_first_fare_usd             : 快車、頭等艙基本票價
+- express_first_per_stop_rate_usd    : 快車、頭等艙每站增量票價
 
 Idempotency:
 - 所有節點與關係建立均使用 MERGE（不用 CREATE），重複執行不產生重複資料
@@ -1228,6 +1233,7 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
   - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
   - Decision: Edge properties — `travel_time_min`（Dijkstra 權重）+ `line`（路線 ID，僅 METRO_LINK/RAIL_LINK）。INTERCHANGE_TO 不儲存 line，固定 travel_time_min=5。 Why: line 加入 MERGE key 以防兩線共用同一對站點時邊互相覆蓋；INTERCHANGE_TO 為步行換乘，不屬於任何路線。
+  - Decision: RAIL_LINK fare 屬性採用 8 欄位（normal/express × standard/first），而非 4 欄位。 Why: 國鐵同一條路線同時有普通車與快車兩種 service_type，票價不同；將兩者展開在同一條邊，query_cheapest_route 可直接用 `r.normal_standard_fare_usd` 或 `r.express_standard_fare_usd` 取值，不需要額外 JOIN 或條件分支查另一張表。
   - Decision: Node properties 為 `station_id`（與 PostgreSQL PK 完全一致）、`name`、`lines`（原生 Neo4j 陣列）。 Why: station_id 對齊保證跨資料庫查詢正確；lines 存為陣列可用 "M1" IN s.lines 高效過濾。
   - Decision: 全部使用 MERGE 不用 CREATE（idempotent）。 Why: 開發期間會多次重新 seed，MERGE 確保安全重跑。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
