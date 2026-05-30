@@ -40,12 +40,16 @@ Graph schema used in this seeder:
       per_stop_rate_usd   — incremental fare per stop
 
     RAIL_LINK:
-      travel_time_min            — numeric weight used by Dijkstra shortest-path queries
-      line                       — line ID (e.g. "NR1")
-      standard_fare_usd          — standard class base fare
-      standard_per_stop_rate_usd — standard class per-stop rate
-      first_fare_usd             — first class base fare
-      first_per_stop_rate_usd    — first class per-stop rate
+      travel_time_min                    — numeric weight used by Dijkstra shortest-path queries
+      line                               — line ID (e.g. "NR1")
+      normal_standard_fare_usd          — normal service, standard class base fare
+      normal_standard_per_stop_rate_usd — normal service, standard class per-stop rate
+      normal_first_fare_usd             — normal service, first class base fare
+      normal_first_per_stop_rate_usd    — normal service, first class per-stop rate
+      express_standard_fare_usd          — express service, standard class base fare
+      express_standard_per_stop_rate_usd — express service, standard class per-stop rate
+      express_first_fare_usd             — express service, first class base fare
+      express_first_per_stop_rate_usd    — express service, first class per-stop rate
 
     INTERCHANGE_TO:
       travel_time_min = 5  — fixed assumed walking time between platforms
@@ -251,26 +255,37 @@ def _create_rail_links(session, rail_stations: list[dict], rail_fare_by_line: di
     Identical logic to _create_metro_links but targets :NationalRailStation
     nodes and creates :RAIL_LINK relationships.
 
+    National rail has two service types — "normal" and "express" — with
+    different fares. Both are stored on each edge so queries can select the
+    appropriate fare without a separate lookup.
+
     Args:
         session: An active Neo4j driver session.
         rail_stations: Parsed list from national_rail_stations.json.
-        rail_fare_by_line: Mapping of line ID → fare dict built from national_rail_schedules.json.
+        rail_fare_by_line: Mapping of line ID → {service_type → fare dict}
+            built from national_rail_schedules.json.
     """
     print("  Creating RAIL_LINK relationships...")
 
     rows = []
     for station in rail_stations:
         for adj in station["adjacent_stations"]:
-            fare = rail_fare_by_line.get(adj["line"], {})
+            fares = rail_fare_by_line.get(adj["line"], {})
+            normal = fares.get("normal", {})
+            express = fares.get("express", {})
             rows.append({
                 "origin_id": station["station_id"],
                 "dest_id": adj["station_id"],
                 "line": adj["line"],
                 "travel_time_min": adj["travel_time_min"],
-                "standard_fare_usd": fare.get("standard_fare_usd"),
-                "standard_per_stop_rate_usd": fare.get("standard_per_stop_rate_usd"),
-                "first_fare_usd": fare.get("first_fare_usd"),
-                "first_per_stop_rate_usd": fare.get("first_per_stop_rate_usd"),
+                "normal_standard_fare_usd": normal.get("standard_fare_usd"),
+                "normal_standard_per_stop_rate_usd": normal.get("standard_per_stop_rate_usd"),
+                "normal_first_fare_usd": normal.get("first_fare_usd"),
+                "normal_first_per_stop_rate_usd": normal.get("first_per_stop_rate_usd"),
+                "express_standard_fare_usd": express.get("standard_fare_usd"),
+                "express_standard_per_stop_rate_usd": express.get("standard_per_stop_rate_usd"),
+                "express_first_fare_usd": express.get("first_fare_usd"),
+                "express_first_per_stop_rate_usd": express.get("first_per_stop_rate_usd"),
             })
 
     session.run(
@@ -279,11 +294,15 @@ def _create_rail_links(session, rail_stations: list[dict], rail_fare_by_line: di
         MATCH (a:NationalRailStation { station_id: row.origin_id })
         MATCH (b:NationalRailStation { station_id: row.dest_id })
         MERGE (a)-[r:RAIL_LINK { line: row.line }]->(b)
-        SET r.travel_time_min            = row.travel_time_min,
-            r.standard_fare_usd          = row.standard_fare_usd,
-            r.standard_per_stop_rate_usd = row.standard_per_stop_rate_usd,
-            r.first_fare_usd             = row.first_fare_usd,
-            r.first_per_stop_rate_usd    = row.first_per_stop_rate_usd
+        SET r.travel_time_min                    = row.travel_time_min,
+            r.normal_standard_fare_usd          = row.normal_standard_fare_usd,
+            r.normal_standard_per_stop_rate_usd = row.normal_standard_per_stop_rate_usd,
+            r.normal_first_fare_usd             = row.normal_first_fare_usd,
+            r.normal_first_per_stop_rate_usd    = row.normal_first_per_stop_rate_usd,
+            r.express_standard_fare_usd          = row.express_standard_fare_usd,
+            r.express_standard_per_stop_rate_usd = row.express_standard_per_stop_rate_usd,
+            r.express_first_fare_usd             = row.express_first_fare_usd,
+            r.express_first_per_stop_rate_usd    = row.express_first_per_stop_rate_usd
         """,
         rows=rows,
     ).consume()
@@ -397,8 +416,11 @@ def seed() -> None:
     rail_fare_by_line: dict = {}
     for sch in rail_schedules:
         line = sch["line"]
+        stype = sch["service_type"]  # "normal" or "express"
         if line not in rail_fare_by_line:
-            rail_fare_by_line[line] = {
+            rail_fare_by_line[line] = {}
+        if stype not in rail_fare_by_line[line]:
+            rail_fare_by_line[line][stype] = {
                 "standard_fare_usd": sch["fare_classes"]["standard"]["base_fare_usd"],
                 "standard_per_stop_rate_usd": sch["fare_classes"]["standard"]["per_stop_rate_usd"],
                 "first_fare_usd": sch["fare_classes"]["first"]["base_fare_usd"],
