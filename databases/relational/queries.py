@@ -28,7 +28,6 @@ import string
 from datetime import datetime, timezone
 from typing import Optional
 
-import bcrypt
 import psycopg2
 import psycopg2.extras
 
@@ -272,68 +271,58 @@ def register_user(
     NOTE: passwords are stored as plain text here intentionally for teaching
     purposes. In production, replace with a salted hash (e.g. bcrypt).
     """
-    import bcrypt, uuid
+    import uuid
 
-    # Generate a unique user_id
-    user_id = "RU-" + str(uuid.uuid4())[:8].upper()
-
-    # Hash password with bcrypt — never store plain text
-    pw_salt = bcrypt.gensalt()
-    pw_hash = bcrypt.hashpw(password.encode(), pw_salt)
-
-    # Hash secret answer lowercase so comparison is case-insensitive
-    ans_salt = bcrypt.gensalt()
-    ans_hash = bcrypt.hashpw(secret_answer.lower().encode(), ans_salt)
-
-    # date_of_birth: only year_of_birth is provided, default to Jan 1
-    dob = f"{year_of_birth}-01-01"
+    # Generate a unique user ID using the first 8 hex chars of a UUID
+    user_id = "RU-" + uuid.uuid4().hex[:8].upper()
+    # Combine first and last name into a single full name string
     full_name = f"{first_name} {surname}"
+    # Only year is provided, so default to Jan 1 of that year
+    dob = f"{year_of_birth}-01-01"
 
-    conn = _connect()
-    conn.autocommit = False  # manual transaction: both inserts must succeed together
+    # Open a direct connection for manual transaction control
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
     try:
         with conn.cursor() as cur:
+            # Insert basic user profile into the users table
             cur.execute(
-                """
-                INSERT INTO users (user_id, full_name, email, date_of_birth)
-                VALUES (%s, %s, %s, %s)
-                """,
+                "INSERT INTO users (user_id, full_name, email, date_of_birth) VALUES (%s, %s, %s, %s)",
                 (user_id, full_name, email, dob),
             )
             cur.execute(
-                """
-                INSERT INTO user_security
-                    (user_id, password_hash, password_salt,
-                     secret_question, secret_answer_hash, secret_answer_salt)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
+                """INSERT INTO user_security
+                       (user_id, password_hash, password_salt, secret_question,
+                        secret_answer_hash, secret_answer_salt)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
                 (
                     user_id,
-                    pw_hash.decode(),
-                    pw_salt.decode(),
+                    password,               # plain text — teaching purposes only (see docstring)
+                    "",                     # no salt — teaching purposes only
                     secret_question,
-                    ans_hash.decode(),
-                    ans_salt.decode(),
+                    secret_answer.lower(),  # lowercase for case-insensitive comparison
+                    "",                     # no salt — teaching purposes only
                 ),
             )
+        # Commit both inserts together as a single atomic transaction
         conn.commit()
         return (True, user_id)
     except Exception as e:
+        # Roll back all changes if anything goes wrong
         conn.rollback()
         return (False, str(e))
     finally:
+        # Always close the connection regardless of success or failure
         conn.close()
-
 
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
     Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
     """
-    import bcrypt
-
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fetch user profile and stored password hash in one query
             cur.execute(
                 """
                 SELECT u.user_id, u.email, u.full_name, u.phone,
@@ -346,12 +335,15 @@ def login_user(email: str, password: str) -> Optional[dict]:
                 (email,),
             )
             row = cur.fetchone()
+            # Convert to plain dict immediately while cursor is still open
+            row = dict(row) if row else None
 
+    # Return None if user not found
     if not row:
         return None
 
-    # Verify password against stored hash
-    if not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+    # Plain text comparison — teaching purposes only (see register_user docstring)
+    if row["password_hash"] != password:
         return None
 
     # Split full_name back into first/surname for the required return shape
@@ -367,11 +359,11 @@ def login_user(email: str, password: str) -> Optional[dict]:
         "is_active":     row["is_active"],
     }
 
-
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Look up the secret question by matching email in users table
             cur.execute(
                 """
                 SELECT us.secret_question
@@ -382,15 +374,16 @@ def get_user_secret_question(email: str) -> Optional[str]:
                 (email,),
             )
             row = cur.fetchone()
-    return row["secret_question"] if row else None
+            # Convert to plain dict while cursor is still open
+            row = dict(row) if row else None
 
+    return row["secret_question"] if row else None
 
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
-    import bcrypt
-
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fetch stored secret answer by matching email
             cur.execute(
                 """
                 SELECT us.secret_answer_hash
@@ -401,26 +394,24 @@ def verify_secret_answer(email: str, answer: str) -> bool:
                 (email,),
             )
             row = cur.fetchone()
+            # Convert to plain dict while cursor is still open
+            row = dict(row) if row else None
 
     if not row or not row["secret_answer_hash"]:
         return False
 
-    # Lowercase input before comparing — matches how it was stored in register_user
-    return bcrypt.checkpw(answer.lower().encode(), row["secret_answer_hash"].encode())
+    # Plain text comparison — answer was stored lowercased in register_user
+    return row["secret_answer_hash"] == answer.lower()
 
 
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
-    import bcrypt
-
-    # Generate a fresh salt and hash for the new password
-    new_salt = bcrypt.gensalt()
-    new_hash = bcrypt.hashpw(new_password.encode(), new_salt)
-
-    conn = _connect()
+    # Open a direct connection for manual transaction control
+    conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
         with conn.cursor() as cur:
+            # Update password as plain text — teaching purposes only (see register_user docstring)
             cur.execute(
                 """
                 UPDATE user_security
@@ -430,7 +421,7 @@ def update_password(email: str, new_password: str) -> bool:
                 WHERE user_security.user_id = u.user_id
                   AND u.email = %s
                 """,
-                (new_hash.decode(), new_salt.decode(), email),
+                (new_password, "", email),  # plain text, no salt — teaching purposes only
             )
             updated = cur.rowcount
         conn.commit()
