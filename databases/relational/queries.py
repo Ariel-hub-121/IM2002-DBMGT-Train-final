@@ -31,6 +31,9 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+_ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
@@ -280,6 +283,11 @@ def register_user(
     # Only year is provided, so default to Jan 1 of that year
     dob = f"{year_of_birth}-01-01"
 
+    # Hash password with Argon2id — salt is embedded in the output string (PHC format)
+    pw_hash = _ph.hash(password)
+    # Hash secret answer lowercase so verify_secret_answer can be case-insensitive
+    ans_hash = _ph.hash(secret_answer.lower())
+
     # Open a direct connection for manual transaction control
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
@@ -290,19 +298,12 @@ def register_user(
                 "INSERT INTO users (user_id, full_name, email, date_of_birth) VALUES (%s, %s, %s, %s)",
                 (user_id, full_name, email, dob),
             )
+            # Insert hashed credentials into the security table
             cur.execute(
                 """INSERT INTO user_security
-                       (user_id, password_hash, password_salt, secret_question,
-                        secret_answer_hash, secret_answer_salt)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (
-                    user_id,
-                    password,               # plain text — teaching purposes only (see docstring)
-                    "",                     # no salt — teaching purposes only
-                    secret_question,
-                    secret_answer.lower(),  # lowercase for case-insensitive comparison
-                    "",                     # no salt — teaching purposes only
-                ),
+                       (user_id, password_hash, secret_question, secret_answer_hash)
+                   VALUES (%s, %s, %s, %s)""",
+                (user_id, pw_hash, secret_question, ans_hash),
             )
         # Commit both inserts together as a single atomic transaction
         conn.commit()
@@ -314,6 +315,7 @@ def register_user(
     finally:
         # Always close the connection regardless of success or failure
         conn.close()
+
 
 def login_user(email: str, password: str) -> Optional[dict]:
     """
@@ -342,8 +344,10 @@ def login_user(email: str, password: str) -> Optional[dict]:
     if not row:
         return None
 
-    # Plain text comparison — teaching purposes only (see register_user docstring)
-    if row["password_hash"] != password:
+    # Verify password against Argon2id hash — raises VerifyMismatchError on wrong password
+    try:
+        _ph.verify(row["password_hash"], password)
+    except VerifyMismatchError:
         return None
 
     # Split full_name back into first/surname for the required return shape
@@ -358,6 +362,7 @@ def login_user(email: str, password: str) -> Optional[dict]:
         "date_of_birth": str(row["date_of_birth"]),
         "is_active":     row["is_active"],
     }
+
 
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
@@ -379,11 +384,12 @@ def get_user_secret_question(email: str) -> Optional[str]:
 
     return row["secret_question"] if row else None
 
+
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Fetch stored secret answer by matching email
+            # Fetch stored secret answer hash by matching email
             cur.execute(
                 """
                 SELECT us.secret_answer_hash
@@ -400,28 +406,33 @@ def verify_secret_answer(email: str, answer: str) -> bool:
     if not row or not row["secret_answer_hash"]:
         return False
 
-    # Plain text comparison — answer was stored lowercased in register_user
-    return row["secret_answer_hash"] == answer.lower()
+    # Lowercase input matches how the answer was stored during registration
+    try:
+        _ph.verify(row["secret_answer_hash"], answer.lower())
+        return True
+    except VerifyMismatchError:
+        return False
 
 
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
+    # Hash the new password before storing
+    new_hash = _ph.hash(new_password)
+
     # Open a direct connection for manual transaction control
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
         with conn.cursor() as cur:
-            # Update password as plain text — teaching purposes only (see register_user docstring)
             cur.execute(
                 """
                 UPDATE user_security
-                SET password_hash = %s,
-                    password_salt = %s
+                SET password_hash = %s
                 FROM users u
                 WHERE user_security.user_id = u.user_id
                   AND u.email = %s
                 """,
-                (new_password, "", email),  # plain text, no salt — teaching purposes only
+                (new_hash, email),
             )
             updated = cur.rowcount
         conn.commit()
@@ -431,7 +442,7 @@ def update_password(email: str, new_password: str) -> bool:
         return False
     finally:
         conn.close()
-
+        
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
 def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K) -> list[dict]:
