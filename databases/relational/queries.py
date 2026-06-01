@@ -161,8 +161,18 @@ def query_national_rail_availability(
             SELECT o.schedule_id,
                    o.origin_stop_order,
                    d.dest_stop_order,
-                   -- stops_travelled is used by the fare calculation later.
-                   (d.dest_stop_order - o.origin_stop_order) AS stops_travelled
+                   -- Count actual stops (is_stop=TRUE) between origin and destination,
+                   -- inclusive of destination but not origin.
+                   -- Using stop_order difference would include pass-through positions
+                   -- (is_stop=FALSE) and overcharge on express schedules.
+                   (SELECT COUNT(*)
+                      FROM national_rail_schedule_stops nrss2
+                     WHERE nrss2.schedule_id  = o.schedule_id
+                       AND nrss2.stop_order   > o.origin_stop_order
+                       AND nrss2.stop_order  <= d.dest_stop_order
+                       AND nrss2.is_stop      = TRUE
+                       AND nrss2.effective_to IS NULL
+                   ) AS stops_travelled
               FROM stop_origin  o
               JOIN stop_dest    d USING (schedule_id)
              WHERE d.dest_stop_order > o.origin_stop_order
