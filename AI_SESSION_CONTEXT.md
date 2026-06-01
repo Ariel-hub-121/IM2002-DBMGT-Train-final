@@ -1279,3 +1279,135 @@ STUB TO IMPLEMENT:
 SCHEMA (relevant tables only):
 [paste only the CREATE TABLE statements your function will query — trim the rest]
 ```
+
+### Code Review Prompt:
+```
+Review this Python database function from the TransitFlow project against 
+the stub contract and schema below.
+
+Check ALL of the following — report only real bugs, not style suggestions:
+
+CORRECTNESS CHECKS:
+1. Table & column names — does it use ONLY names that exist in the schema below?
+   Flag any invented column or table name.
+
+2. Return type & shape — does it match the stub's return type exactly?
+   - list-returning functions must return [] (not None) when no rows found
+   - Optional[dict]-returning functions must return None (not []) when not found
+   - execute_ functions must return (True, dict) on success and (False, str) on failure
+   - query_user_bookings must always return {"national_rail": [...], "metro": [...]}
+     — both keys must be present even when empty
+
+3. Connection pattern — does it follow this exact pattern for read-only functions?
+     with _connect() as conn:
+         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+             cur.execute(...)
+             return [dict(row) for row in cur.fetchall()]  # or fetchone()
+   Flag if _connect() is missing, RealDictCursor is missing, or rows are not 
+   converted to dict.
+
+4. Write operation pattern — for execute_ functions only:
+   - Must NOT use _connect() — must use psycopg2.connect(PG_DSN) directly
+   - Must set conn.autocommit = False
+   - ALL inserts (e.g. travel_orders + bookings + booking_tickets + payments) 
+     must be committed in a single conn.commit() — not separate commits
+   - Must have conn.rollback() in the except branch
+   - Must return (False, error_string) on failure, never raise
+
+5. SQL injection — are ALL user-supplied values passed as %s parameters?
+   Flag any value concatenated directly into the SQL string.
+
+6. Empty-result handling — does fetchone() result get checked for None before 
+   calling dict() on it? A bare dict(cur.fetchone()) will crash if no row found.
+
+7. Two-network logic (national rail vs metro):
+   - National rail bookings use: travel_orders → bookings → booking_tickets
+   - Metro purchases use: travel_orders → metro_trip_purchases
+   - Day pass journeys use: metro_day_pass_trips (child of metro_trip_purchases)
+   Flag if the wrong tables are used for the wrong network.
+
+8. Fare arithmetic — if fare is calculated in Python, verify:
+   total_fare_usd = base_fare_usd + (per_stop_rate_usd × stops_travelled)
+   Flag if the formula is wrong or if fare is calculated in the wrong currency type.
+
+9. Auth functions only — password handling:
+   - Plain-text password storage = critical bug
+   - Must use argon2 ph.hash() to store, ph.verify() to check
+   - login_user must return None (not raise) on wrong password
+
+10. Refund logic (execute_cancellation only):
+    - Normal service → RF001: 100% if ≥48h, 75% if 24–48h, 50% if 2–24h, 0% if <2h
+    - Express service → RF002: 100% if ≥48h, 50% if 24–48h, 0% if <24h
+    - Must use the booking's scheduled departure_time + travel_date to calculate 
+      hours_before_departure, not the current date alone
+    Flag if the wrong policy is applied or if the time calculation is incorrect.
+
+STUB (the contract):
+[paste the original stub]
+
+IMPLEMENTATION TO REVIEW:
+[paste your code]
+
+SCHEMA (relevant tables only):
+[paste relevant CREATE TABLE statements]
+```
+### Debugging Prompt
+```
+I have a bug in a Python database function from the TransitFlow project.
+Help me fix it without changing the function's signature, return type, or logic 
+that is already correct.
+
+ERROR INFORMATION:
+Full traceback:
+[paste the full traceback]
+
+ERROR TYPE (check one):
+[ ] Runtime crash (exception raised during execution)
+[ ] Wrong data returned (no crash but result is incorrect)
+[ ] Transaction not committed (data not saved to database)
+[ ] Silent failure (returns [] or None when data should exist)
+
+FUNCTION WITH BUG:
+[paste your code]
+
+ORIGINAL STUB (the contract this function must satisfy):
+[paste the original stub]
+
+SCHEMA (relevant tables only):
+[paste relevant CREATE TABLE statements]
+
+WHAT I EXPECTED:
+[one sentence for example：
+"Should return a list of available seats for schedule NR_SCH01 on 2026-05-01
+in standard class, but it returns an empty list instead."]
+
+WHAT ACTUALLY HAPPENED:
+[one sentence for example：
+"Returns [] even though the database has confirmed seats for that date."]
+
+CONSTRAINTS — the fix must:
+1. Keep the same function signature (parameter names, return type)
+2. Use only table/column names that exist in the schema above
+3. Use _connect() + RealDictCursor for read-only functions
+   OR psycopg2.connect(PG_DSN) with manual commit/rollback for execute_ functions
+4. Return [] not None for list-returning functions when no rows found
+5. Return None not [] for Optional[dict]-returning functions when not found
+6. Keep ALL user inputs as %s parameters — no f-strings in SQL
+
+KNOWN PROJECT-SPECIFIC PITFALLS (check if any apply to this bug):
+[ ] fetchone() called without checking for None first
+[ ] Two tables joined in wrong order (national rail vs metro tables mixed up)
+[ ] Fare formula wrong: should be base_fare + (per_stop_rate × stops_travelled)
+[ ] execute_ function used _connect() instead of psycopg2.connect(PG_DSN)
+[ ] Multiple conn.commit() calls instead of one atomic commit
+[ ] Password stored as plain text instead of argon2 hash
+[ ] Refund hours calculated from today's date instead of scheduled departure datetime
+[ ] stop_order / stop_sequence used incorrectly to determine direction of travel
+[ ] Day pass trips queried from metro_trip_purchases instead of metro_day_pass_trips
+
+OUTPUT FORMAT:
+1. Identify the root cause in one sentence
+2. Show only the fixed code (complete function)
+3. Add a one-line comment on the line that was changed explaining what was wrong
+Do NOT rewrite parts that were already correct.
+```
