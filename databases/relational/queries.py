@@ -77,14 +77,188 @@ def query_national_rail_availability(
     """
     Return national rail schedules that serve both origin and destination stations
     in the correct order, along with seat occupancy for the requested travel date.
+    
+    HOW IT WORKS
+    ------------
+    The query performs the following steps:
+
+    1.  Find every schedule that stops at `origin_id`  (stop_origin CTE).
+    2.  Find every schedule that stops at `destination_id` (stop_dest CTE).
+    3.  Keep only schedules present in BOTH CTEs AND where the origin stop comes
+        BEFORE the destination stop (stop_order comparison).  This ensures we
+        never return a schedule that runs in the wrong direction.
+    4.  Join to `national_rail_schedules` to obtain schedule metadata
+        (line name, service type, direction, departure/arrival windows,
+        frequency, etc.).
+    5.  If `travel_date` is provided:
+          • Restrict results to schedules that operate on the weekday matching
+            `travel_date` (e.g. "2025-06-01" is a Sunday → filter for 'sun').
+          • Count booked/confirmed seats on that date to compute occupancy,
+            then subtract from the total seat count to get available_seats.
+        If `travel_date` is omitted, available_seats equals total_seats
+        (no bookings subtracted, since there is no date to check against).
+    6.  Compute `stops_travelled` = dest.stop_order − origin.stop_order, which
+        is needed later by query_national_rail_fare() to price the journey.
+    7.  Also return the origin/destination stop names for display purposes.
 
     Args:
         origin_id:       e.g. "NR01"
         destination_id:  e.g. "NR05"
         travel_date:     e.g. "2025-06-01" — used to count bookings; omit for general info
+    
+    Returns:
+        List of dicts, one per matching schedule, containing:
+          schedule_id, line_name, service_type, direction,
+          first_train_time, last_train_time, frequency_min,
+          origin_stop_order, dest_stop_order, stops_travelled,
+          origin_station_name, destination_station_name,
+          total_seats, available_seats
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    # ------------------------------------------------------------------
+    # Build the day-of-week filter clause dynamically.
+    # PostgreSQL's TO_CHAR(..., 'Dy') returns 3-letter abbreviations with
+    # mixed case (e.g. 'Mon', 'Sun').  We use LOWER() so it matches the
+    # CHECK constraint values in national_rail_schedule_operating_days
+    # ('mon', 'tue', ..., 'sun').
+    # ------------------------------------------------------------------
+    day_filter_clause = ""
+    if travel_date:
+        # Add a WHERE predicate that restricts to schedules operating on
+        # the weekday of the supplied travel_date.
+        day_filter_clause = """
+            AND nrs.schedule_id IN (
+                SELECT schedule_id
+                  FROM national_rail_schedule_operating_days
+                 WHERE day_of_week = LOWER(TO_CHAR(%s::date, 'Dy'))
+            )
+        """
 
+    sql = f"""
+        -- CTE 1: all active stops at the origin station for any schedule.
+        -- effective_to IS NULL means the stop record is currently active.
+        WITH stop_origin AS (
+            SELECT schedule_id,
+                   stop_order AS origin_stop_order
+              FROM national_rail_schedule_stops
+             WHERE station_id    = %s
+               AND is_stop       = TRUE
+               AND effective_to  IS NULL
+        ),
+
+        -- CTE 2: all active stops at the destination station for any schedule.
+        stop_dest AS (
+            SELECT schedule_id,
+                   stop_order AS dest_stop_order
+              FROM national_rail_schedule_stops
+             WHERE station_id    = %s
+               AND is_stop       = TRUE
+               AND effective_to  IS NULL
+        ),
+
+        -- CTE 3: valid schedules = schedules that appear in BOTH CTEs
+        -- AND where origin comes strictly before destination in stop order.
+        valid_schedules AS (
+            SELECT o.schedule_id,
+                   o.origin_stop_order,
+                   d.dest_stop_order,
+                   -- stops_travelled is used by the fare calculation later.
+                   (d.dest_stop_order - o.origin_stop_order) AS stops_travelled
+              FROM stop_origin  o
+              JOIN stop_dest    d USING (schedule_id)
+             WHERE d.dest_stop_order > o.origin_stop_order
+        )
+
+        SELECT
+            nrs.schedule_id,
+            nrs.line_name,
+            nrs.service_type,
+            nrs.direction,
+            nrs.first_train_time,
+            nrs.last_train_time,
+            nrs.frequency_min,
+            vs.origin_stop_order,
+            vs.dest_stop_order,
+            vs.stops_travelled,
+
+            -- Origin and destination station names (denormalised for display).
+            origin_stn.name   AS origin_station_name,
+            dest_stn.name     AS destination_station_name,
+
+            -- Total seat capacity for this schedule across all coaches.
+            -- Traverses: national_rail_seats → national_rail_coaches
+            --            → national_rail_seat_layouts → national_rail_schedules.
+            -- This gives the physical seat count regardless of booking date.
+            COALESCE((
+                SELECT COUNT(*)
+                  FROM national_rail_seats      ns2
+                  JOIN national_rail_coaches    nc  ON nc.coach_id   = ns2.coach_id
+                  JOIN national_rail_seat_layouts nsl ON nsl.layout_id = nc.layout_id
+                 WHERE nsl.schedule_id = nrs.schedule_id
+            ), 0) AS total_seats,
+
+            -- Available seats = total seats minus seats already booked on travel_date.
+            -- When travel_date is NULL, the booked_seats subquery returns 0 for every
+            -- schedule (NULL::date comparison is always NULL, COUNT returns 0), so
+            -- available_seats equals total_seats — correct behaviour for a date-free lookup.
+            COALESCE((
+                SELECT COUNT(*)
+                  FROM national_rail_seats      ns2
+                  JOIN national_rail_coaches    nc  ON nc.coach_id   = ns2.coach_id
+                  JOIN national_rail_seat_layouts nsl ON nsl.layout_id = nc.layout_id
+                 WHERE nsl.schedule_id = nrs.schedule_id
+            ), 0)
+            -
+            COALESCE((
+                -- Count non-cancelled tickets for this schedule on the requested date.
+                -- seat_pk IS NOT NULL ensures we only count tickets with an assigned seat
+                -- (not ticketless bookings), matching the schema's seat-uniqueness index.
+                SELECT COUNT(*)
+                  FROM booking_tickets bt
+                 WHERE bt.schedule_id  = nrs.schedule_id
+                   AND bt.travel_date  = %s::date
+                   AND bt.status      != 'cancelled'
+                   AND bt.seat_pk     IS NOT NULL
+            ), 0) AS available_seats
+
+        FROM valid_schedules     vs
+        JOIN national_rail_schedules nrs ON nrs.schedule_id = vs.schedule_id
+
+        -- Join to station master tables to resolve human-readable names.
+        JOIN national_rail_stations origin_stn ON origin_stn.station_id = %s
+        JOIN national_rail_stations dest_stn   ON dest_stn.station_id   = %s
+
+        -- Apply the optional operating-day filter (empty string when no date given).
+        WHERE TRUE
+        {day_filter_clause}
+
+        ORDER BY nrs.line_name, nrs.schedule_id;
+    """
+
+    # Build the parameter list in the same order as the %s placeholders above.
+    # Placeholders in order:
+    #   1. stop_origin WHERE station_id = %s
+    #   2. stop_dest   WHERE station_id = %s
+    #   3. total_seats subquery  (no parameter — counts all seats for the schedule)
+    #   4. booked_seats subquery travel_date = %s::date
+    #   5. origin_stn  JOIN      station_id = %s
+    #   6. dest_stn    JOIN      station_id = %s
+    #   7. (optional)  day_filter %s::date
+    params = [
+        origin_id,       # 1. stop_origin WHERE station_id = %s
+        destination_id,  # 2. stop_dest   WHERE station_id = %s
+        travel_date,     # 3. booked_seats subquery: travel_date = %s::date (NULL-safe)
+        origin_id,       # 4. origin station name JOIN
+        destination_id,  # 5. destination station name JOIN
+    ]
+
+    if travel_date:
+        # 6. The day-of-week filter needs travel_date a second time.
+        params.append(travel_date)
+
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
 
 def query_national_rail_fare(
     schedule_id: str,
@@ -94,16 +268,58 @@ def query_national_rail_fare(
     """
     Calculate the fare for a national rail journey.
 
+    HOW IT WORKS
+    ------------
+    National rail pricing uses a two-part formula stored in
+    `national_rail_schedule_fares`:
+
+        total_fare = base_fare_usd + (per_stop_rate_usd × stops_travelled)
+
+    Each schedule can have two fare rows — one for 'standard' and one for
+    'first' class — so the query must filter on both `schedule_id` AND
+    `fare_class` to retrieve the correct parameters.
+
+    The total fare is computed entirely in SQL using NUMERIC arithmetic
+    (no floating-point rounding errors) and returned alongside the raw
+    components so the caller can display an itemised breakdown to the user.
+
     Args:
         schedule_id:     e.g. "NR_SCH01"
         fare_class:      "standard" or "first"
         stops_travelled: number of stops between origin and destination (inclusive)
 
     Returns:
-        dict with fare_class, base_fare_usd, per_stop_rate_usd, total_fare_usd
+        dict with keys:
+          fare_class        – the requested class ("standard" / "first")
+          base_fare_usd     – fixed component of the fare (NUMERIC)
+          per_stop_rate_usd – variable rate per stop (NUMERIC)
+          total_fare_usd    – base + per_stop_rate × stops_travelled (NUMERIC)
+        or None if no fare record exists for the given schedule / class combo.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
 
+    sql = """
+        SELECT
+            fare_class,
+            base_fare_usd,
+            per_stop_rate_usd,
+            -- Compute total fare in SQL to keep all arithmetic in NUMERIC,
+            -- preventing any Python float rounding when the caller displays it.
+            base_fare_usd + (per_stop_rate_usd * %s) AS total_fare_usd
+        FROM national_rail_schedule_fares
+        WHERE schedule_id = %s
+          AND fare_class  = %s;
+    """
+
+    # Parameters in placeholder order:
+    #   1. %s  → stops_travelled (used in the arithmetic expression)
+    #   2. %s  → schedule_id
+    #   3. %s  → fare_class
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (stops_travelled, schedule_id, fare_class))
+            row = cur.fetchone()
+            # fetchone() returns None when no matching fare row exists.
+            return dict(row) if row else None
 
 # ── METRO SCHEDULES & FARE ────────────────────────────────────────────────────
 
@@ -111,26 +327,168 @@ def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
     """
     Return metro schedules that serve both origin and destination in the correct order.
 
+    HOW IT WORKS
+    ------------
+    The query mirrors the national rail availability logic but targets the metro
+    tables and omits the date/occupancy dimension (metro trips are pay-as-you-go;
+    there is no reserved seating and no capacity check needed).
+
+    1.  Find all stops for `origin_id`      (stop_origin CTE).
+    2.  Find all stops for `destination_id` (stop_dest   CTE).
+    3.  Keep schedules present in BOTH CTEs where origin stop_sequence is
+        strictly less than destination stop_sequence.
+    4.  Join to `metro_schedules` for full schedule metadata including the
+        fare parameters (base_fare_usd, per_stop_rate_usd) stored directly
+        on the schedule row.
+    5.  Join to `metro_stations` twice for human-readable station names.
+    6.  Compute stops_travelled = dest.stop_sequence − origin.stop_sequence
+        for use in query_metro_fare().
+
+    Metro schedules also carry operating-day information in
+    `metro_schedule_operating_days`, but that table is intentionally NOT
+    filtered here: the agent layer decides whether to surface day-of-week
+    restrictions to the user.  All matching schedules are returned so the
+    caller has the complete picture.
+
     Args:
         origin_id:       e.g. "MS01"
         destination_id:  e.g. "MS09"
+    
+    Returns:
+        List of dicts, one per matching schedule, containing:
+          schedule_id, line_name, direction,
+          first_train_time, last_train_time, frequency_min,
+          base_fare_usd, per_stop_rate_usd,
+          origin_stop_sequence, dest_stop_sequence, stops_travelled,
+          origin_station_name, destination_station_name,
+          operating_days  (sorted list of 3-letter day abbreviations)
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
 
+    sql = """
+        -- CTE 1: all stops at the origin station across every metro schedule.
+        WITH stop_origin AS (
+            SELECT schedule_id,
+                   stop_sequence AS origin_stop_sequence
+              FROM metro_schedule_stops
+             WHERE station_id = %s
+        ),
+
+        -- CTE 2: all stops at the destination station across every metro schedule.
+        stop_dest AS (
+            SELECT schedule_id,
+                   stop_sequence AS dest_stop_sequence
+              FROM metro_schedule_stops
+             WHERE station_id = %s
+        ),
+
+        -- CTE 3: schedules valid for this journey direction.
+        -- origin_stop_sequence must be strictly less than dest_stop_sequence.
+        valid_schedules AS (
+            SELECT o.schedule_id,
+                   o.origin_stop_sequence,
+                   d.dest_stop_sequence,
+                   (d.dest_stop_sequence - o.origin_stop_sequence) AS stops_travelled
+              FROM stop_origin o
+              JOIN stop_dest   d USING (schedule_id)
+             WHERE d.dest_stop_sequence > o.origin_stop_sequence
+        ),
+
+        -- CTE 4: aggregate operating days per schedule into a sorted array so
+        -- the caller receives a single row per schedule (avoids fan-out from
+        -- joining metro_schedule_operating_days directly).
+        operating_days_agg AS (
+            SELECT schedule_id,
+                   ARRAY_AGG(day_of_week ORDER BY day_of_week) AS operating_days
+              FROM metro_schedule_operating_days
+             GROUP BY schedule_id
+        )
+
+        SELECT
+            ms.schedule_id,
+            ms.line_name,
+            ms.direction,
+            ms.first_train_time,
+            ms.last_train_time,
+            ms.frequency_min,
+            -- Fare components are stored directly on metro_schedules.
+            ms.base_fare_usd,
+            ms.per_stop_rate_usd,
+            vs.origin_stop_sequence,
+            vs.dest_stop_sequence,
+            vs.stops_travelled,
+            -- Human-readable station names for display in the agent's response.
+            origin_stn.name AS origin_station_name,
+            dest_stn.name   AS destination_station_name,
+            -- Coalesce in case a schedule somehow has no operating_days rows.
+            COALESCE(oda.operating_days, ARRAY[]::VARCHAR[]) AS operating_days
+
+        FROM valid_schedules         vs
+        JOIN metro_schedules         ms        ON ms.schedule_id  = vs.schedule_id
+        JOIN metro_stations          origin_stn ON origin_stn.station_id = %s
+        JOIN metro_stations          dest_stn   ON dest_stn.station_id   = %s
+        LEFT JOIN operating_days_agg oda        ON oda.schedule_id       = ms.schedule_id
+
+        ORDER BY ms.line_name, ms.schedule_id;
+    """
+
+    # Parameters in placeholder order:
+    #   1. %s → stop_origin WHERE station_id = %s
+    #   2. %s → stop_dest   WHERE station_id = %s
+    #   3. %s → origin_stn  JOIN station_id  = %s  (for name lookup)
+    #   4. %s → dest_stn    JOIN station_id  = %s  (for name lookup)
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (origin_id, destination_id, origin_id, destination_id))
+            return [dict(row) for row in cur.fetchall()]
 
 def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
     """
     Calculate the metro fare for a single-ticket journey.
+
+    HOW IT WORKS
+    ------------
+    Metro pricing uses the same two-part formula as national rail, but the
+    fare parameters (base_fare_usd, per_stop_rate_usd) are stored directly
+    on the `metro_schedules` row rather than in a separate fares table.
+    There is only one fare class for metro (no 'standard' / 'first' split).
+
+        total_fare = base_fare_usd + (per_stop_rate_usd × stops_travelled)
+
+    All arithmetic is done inside SQL using NUMERIC types to avoid any
+    floating-point rounding that could occur if the multiplication were
+    performed in Python.
 
     Args:
         schedule_id:     e.g. "MS_SCH01"
         stops_travelled: number of stops between origin and destination
 
     Returns:
-        dict with base_fare_usd, per_stop_rate_usd, total_fare_usd
+        dict with keys:
+          base_fare_usd     – fixed component of the fare (NUMERIC)
+          per_stop_rate_usd – variable rate per stop (NUMERIC)
+          total_fare_usd    – base + per_stop_rate × stops_travelled (NUMERIC)
+        or None if no schedule with the given ID exists.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    sql = """
+        SELECT
+            base_fare_usd,
+            per_stop_rate_usd,
+            -- Compute total fare in SQL so all intermediate values remain NUMERIC,
+            -- consistent with how national rail fares are handled.
+            base_fare_usd + (per_stop_rate_usd * %s) AS total_fare_usd
+        FROM metro_schedules
+        WHERE schedule_id = %s;
+    """
 
+    # Parameters in placeholder order:
+    #   1. %s → stops_travelled (used in the arithmetic expression)
+    #   2. %s → schedule_id
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (stops_travelled, schedule_id))
+            row = cur.fetchone()
+            # fetchone() returns None when the schedule_id does not exist.
+            return dict(row) if row else None
 
 # ── SEAT SELECTION ────────────────────────────────────────────────────────────
 
