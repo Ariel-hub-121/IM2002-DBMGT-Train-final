@@ -1229,14 +1229,14 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
 - [ ] Schema design: TODO — add your table/column decisions here
-- [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-31):
+- [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-30):
   - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
   - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
   - Decision: Edge properties — `travel_time_min`（Dijkstra 權重）+ `line`（路線 ID，僅 METRO_LINK/RAIL_LINK）。INTERCHANGE_TO 不儲存 line，固定 travel_time_min=5。 Why: line 加入 MERGE key 以防兩線共用同一對站點時邊互相覆蓋；INTERCHANGE_TO 為步行換乘，不屬於任何路線。
   - Decision: RAIL_LINK fare 屬性採用 8 欄位（normal/express × standard/first），而非 4 欄位。 Why: 國鐵同一條路線同時有普通車與快車兩種 service_type，票價不同；將兩者展開在同一條邊，query_cheapest_route 可直接用 `r.normal_standard_fare_usd` 或 `r.express_standard_fare_usd` 取值，不需要額外 JOIN 或條件分支查另一張表。
   - Decision: Node properties 為 `station_id`（與 PostgreSQL PK 完全一致）、`name`、`lines`（原生 Neo4j 陣列）。 Why: station_id 對齊保證跨資料庫查詢正確；lines 存為陣列可用 "M1" IN s.lines 高效過濾。
   - Decision: 全部使用 MERGE 不用 CREATE（idempotent）。 Why: 開發期間會多次重新 seed，MERGE 確保安全重跑。
-- [x] PostgreSQL seeding (已在 seed_postgres.py 全部實作，2026-05-30):
+- [x] PostgreSQL seeding (已在 seed_postgres.py 全部實作，2026-05-31):
   **執行順序與 FK 依賴**
   - Decision: 執行順序固定為 `seed_metro_stations → seed_national_rail_stations → seed_metro_schedules → seed_national_rail_schedules → seed_seat_layouts → seed_users → seed_national_rail_bookings → seed_metro_travels → seed_payments → seed_feedback`。`metro_rail_interchanges` 放在 `seed_national_rail_stations` 結尾插入，而非 `seed_metro_stations` 中。Why: FK 約束強制此順序；`metro_rail_interchanges` 同時有指向捷運站和國鐵站的 FK，必須等兩個父表都存在才能插入。
   **Idempotency 策略**
