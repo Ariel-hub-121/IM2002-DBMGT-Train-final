@@ -207,7 +207,6 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
 
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
-
 def execute_booking(
     user_id: str,
     schedule_id: str,
@@ -234,12 +233,6 @@ def execute_booking(
     Returns:
         (True, booking_dict)   on success
         (False, error_message) on failure
-
-    Fixes applied vs. original:
-        BUG-1  status 欄位改用 %s 參數綁定，不再以 inline literal 嵌入 SQL。
-        BUG-2  票價運算全程使用 Decimal，不強制轉為 float，
-               保留 NUMERIC(10,2) 欄位的精確小數語義。
-               僅在最終回傳 dict 時才轉為 float（供 JSON 序列化）。
     """
     # Open a manual-commit connection so booking + payment are atomic
     conn = psycopg2.connect(PG_DSN)
@@ -285,8 +278,8 @@ def execute_booking(
             stops_travelled = abs(stop_rows[1]["stop_order"] - stop_rows[0]["stop_order"])
 
             # ── 3. Calculate fare ──
-            # FIX BUG-2: 保留 psycopg2 回傳的 Decimal 型別，不轉 float。
-            # Decimal(stops_travelled) 確保乘法在 Decimal 域內完成，避免浮點誤差。
+            # Keep psycopg2's Decimal return type throughout to avoid floating-point errors.
+            # Decimal(stops_travelled) ensures multiplication stays in the Decimal domain.
             base_fare     = schedule["base_fare_usd"]        # Decimal
             per_stop_rate = schedule["per_stop_rate_usd"]    # Decimal
             total_fare    = base_fare + per_stop_rate * Decimal(stops_travelled)
@@ -359,13 +352,13 @@ def execute_booking(
             payment_id = _gen_payment_id()
 
             # ── 6. Insert travel_orders ──
+            # FIX BUG-1: all values bound via %s — no inline literals in SQL string
             cur.execute(
                 """
                 INSERT INTO travel_orders (order_id, user_id, order_type, amount_usd, status)
-                VALUES (%s, %s, 'national_rail', %s, 'confirmed')
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                (booking_id, user_id, round(total_fare, 2)),
-                # round() 在 Decimal 域內仍是精確的，結果為 Decimal。
+                (booking_id, user_id, "national_rail", round(total_fare, 2), "confirmed"),
             )
 
             # ── 7. Insert bookings header ──
@@ -375,7 +368,7 @@ def execute_booking(
             )
 
             # ── 8. Insert booking_tickets ──
-            # FIX BUG-1: status 改用 %s 參數綁定，移除原本的 inline literal 'confirmed'。
+            # status bound via %s so it is consistent with step 6 above
             leg = "single" if ticket_type == "single" else "outbound"
             cur.execute(
                 """
@@ -389,7 +382,6 @@ def execute_booking(
                     booking_id, schedule_id, origin_station_id, destination_station_id,
                     seat_pk, travel_date, departure_time, ticket_type, fare_class,
                     coach, seat_code, stops_travelled, leg, "confirmed",
-                    # ↑ 現在是第 14 個 %s 的綁定值，不再是 SQL 字串的一部分。
                 ),
             )
 
@@ -397,16 +389,16 @@ def execute_booking(
             cur.execute(
                 """
                 INSERT INTO payments (payment_id, amount_usd, method, status, paid_at)
-                VALUES (%s, %s, 'credit_card', 'paid', NOW())
+                VALUES (%s, %s, %s, %s, NOW())
                 """,
-                (payment_id, round(total_fare, 2)),
+                (payment_id, round(total_fare, 2), "credit_card", "paid"),
             )
             cur.execute(
                 """
                 INSERT INTO payment_sources (payment_id, source_type, national_rail_booking_id)
-                VALUES (%s, 'national_rail_booking', %s)
+                VALUES (%s, %s, %s)
                 """,
-                (payment_id, booking_id),
+                (payment_id, "national_rail_booking", booking_id),
             )
 
         # Single commit covers all inserts — atomicity requirement met
@@ -424,7 +416,7 @@ def execute_booking(
             "seat_code":               seat_code,
             "coach":                   coach,
             "stops_travelled":         stops_travelled,
-            # FIX BUG-2: 僅在最終輸出時才轉為 float，供 JSON 序列化使用。
+            # Convert to float only at the final output boundary for JSON serialisation
             "amount_usd":              float(round(total_fare, 2)),
             "payment_id":              payment_id,
         }
@@ -441,9 +433,10 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
     """
     Cancel a national rail booking owned by the given user.
 
-    Calculates the refund amount according to the booking's service type:
-      - Normal service: RF001 windows (100% / 75% / 50% / 0%)
-      - Express service: RF002 windows (100% / 50% / 0%)
+    Refund policy:
+      - Normal service  RF001: ≥48h → 100%, 24–48h → 75% ($0.50 fee),
+                               2–24h → 50% ($0.50 fee), <2h → 0%
+      - Express service RF002: ≥48h → 100%, 24–48h → 50% ($1.00 fee), <24h → 0%
 
     Args:
         booking_id: e.g. "BK001"
@@ -452,13 +445,6 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
     Returns:
         (True, result_dict)  with refund_amount_usd and policy note
         (False, error_msg)
-
-    Fixes applied vs. original:
-        BUG-3  退款金額運算全程使用 Decimal，不強制轉為 float，
-               保留 NUMERIC(10,2) 欄位的精確小數語義。
-               refund_pct 與 admin_fee 均以字串建構 Decimal（避免從
-               浮點數字面值建構帶入誤差）。
-               僅在最終回傳 dict 時才轉為 float（供 JSON 序列化）。
     """
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
@@ -486,7 +472,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 return (False, "Booking not found, already cancelled, or does not belong to this user")
 
             service_type = order["service_type"]
-            # FIX BUG-3: 不轉 float，直接保留 psycopg2 回傳的 Decimal。
+            # Keep psycopg2's Decimal return type to preserve NUMERIC(10,2) precision
             amount_usd = order["amount_usd"]   # Decimal
 
             # ── 2. Get the earliest uncancelled ticket's departure datetime ──
@@ -505,6 +491,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             if not ticket:
                 return (False, "No active tickets found for this booking")
 
+            # Combine date + time into a timezone-aware datetime for accurate hour calculation
             departure_dt = datetime.combine(
                 ticket["travel_date"],
                 ticket["departure_time"],
@@ -513,15 +500,12 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             now = datetime.now(timezone.utc)
             hours_before = (departure_dt - now).total_seconds() / 3600
 
-            # ── 3. Apply refund policy based on service_type and hours_before_departure ──
-            # FIX BUG-3: refund_pct 與 admin_fee 均以字串建構 Decimal。
+            # ── 3. Apply refund policy ──
+            # All percentages and fees built from strings to avoid inheriting
+            # floating-point error (e.g. Decimal(0.75) → Decimal('0.7499...'))
             #
-            # 為什麼必須用字串？
-            #   Decimal(0.75)   → Decimal('0.74999999...') ← 繼承浮點誤差
-            #   Decimal("0.75") → Decimal('0.75')          ← 精確
-            #
-            # RF001 (normal): ≥48h→100%, 24–48h→75% ($0.50 fee), 2–24h→50% ($0.50 fee), <2h→0%
-            # RF002 (express): ≥48h→100% ($1.00 fee), 24–48h→50% ($1.00 fee), <24h→0%
+            # RF001 (normal):  ≥48h→100%, 24–48h→75% ($0.50 fee), 2–24h→50% ($0.50 fee), <2h→0%
+            # RF002 (express): ≥48h→100%, 24–48h→50% ($1.00 fee), <24h→0%
             if service_type == "normal":
                 if hours_before >= 48:
                     refund_pct  = Decimal("1.00")
@@ -540,11 +524,12 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                     admin_fee   = Decimal("0.00")
                     policy_note = "RF001 W4: no refund (<2 h before departure)"
             else:
-                # express service — RF002
+                # Express service — RF002
+                # FIX BUG-2: W1 (≥48h) is a full refund with no admin fee per RF002 spec
                 if hours_before >= 48:
                     refund_pct  = Decimal("1.00")
-                    admin_fee   = Decimal("1.00")
-                    policy_note = "RF002 W1: full refund minus $1.00 fee (≥48 h before departure)"
+                    admin_fee   = Decimal("0.00")
+                    policy_note = "RF002 W1: full refund (≥48 h before departure)"
                 elif hours_before >= 24:
                     refund_pct  = Decimal("0.50")
                     admin_fee   = Decimal("1.00")
@@ -554,7 +539,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                     admin_fee   = Decimal("0.00")
                     policy_note = "RF002 W3: no refund (<24 h before departure)"
 
-            # max() 在 Decimal 域內比較，round() 結果仍為精確 Decimal。
+            # Clamp to zero in case fee exceeds the refund amount
             refund_amount = max(Decimal("0.00"), round(amount_usd * refund_pct - admin_fee, 2))
 
             # ── 4. Cancel all confirmed tickets in this booking ──
@@ -592,7 +577,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
         return (True, {
             "booking_id":        booking_id,
             "status":            "cancelled",
-            # FIX BUG-3: 僅在最終輸出時才轉為 float，供 JSON 序列化使用。
+            # Convert to float only at the final output boundary for JSON serialisation
             "refund_amount_usd": float(refund_amount),
             "policy_note":       policy_note,
         })
