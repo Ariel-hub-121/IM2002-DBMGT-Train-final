@@ -430,7 +430,13 @@ def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
         -- joining metro_schedule_operating_days directly).
         operating_days_agg AS (
             SELECT schedule_id,
-                   ARRAY_AGG(day_of_week ORDER BY day_of_week) AS operating_days
+                   ARRAY_AGG(day_of_week ORDER BY
+                       CASE day_of_week
+                           WHEN 'mon' THEN 1 WHEN 'tue' THEN 2 WHEN 'wed' THEN 3
+                           WHEN 'thu' THEN 4 WHEN 'fri' THEN 5 WHEN 'sat' THEN 6
+                           WHEN 'sun' THEN 7
+                       END
+                   ) AS operating_days
               FROM metro_schedule_operating_days
              GROUP BY schedule_id
         )
