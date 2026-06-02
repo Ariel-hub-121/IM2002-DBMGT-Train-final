@@ -271,8 +271,8 @@ def register_user(
     Register a new user.
     Returns (True, user_id) on success or (False, error_message) on failure.
 
-    NOTE: passwords are stored as plain text here intentionally for teaching
-    purposes. In production, replace with a salted hash (e.g. bcrypt).
+    Passwords are hashed with Argon2id before storage.
+    The salt is embedded in the PHC-format hash string — no separate salt column needed.
     """
     import uuid
 
@@ -283,7 +283,7 @@ def register_user(
     # Only year is provided, so default to Jan 1 of that year
     dob = f"{year_of_birth}-01-01"
 
-    # Hash password with Argon2id — salt is embedded in the output string (PHC format)
+    # Hash password with Argon2id — salt is embedded in the output PHC string
     pw_hash = _ph.hash(password)
     # Hash secret answer lowercase so verify_secret_answer can be case-insensitive
     ans_hash = _ph.hash(secret_answer.lower())
@@ -295,22 +295,22 @@ def register_user(
         with conn.cursor() as cur:
             # Insert basic user profile into the users table
             cur.execute(
-                "INSERT INTO users (user_id, full_name, email, date_of_birth) VALUES (%s, %s, %s, %s)",
+                """
+                INSERT INTO users (user_id, full_name, email, date_of_birth)
+                VALUES (%s, %s, %s, %s)
+                """,
                 (user_id, full_name, email, dob),
             )
-            # Insert hashed credentials into the security table
+            # Insert hashed credentials — salt columns omitted because
+            # Argon2id embeds the salt inside the PHC hash string
             cur.execute(
-            """INSERT INTO user_security (user_id, password_hash, password_salt, secret_question, secret_answer_hash, secret_answer_salt)
-            VALUES (%s, %s, %s, %s, %s, %s)""",
-            (
-                user_id,
-                pw_hash,
-            "",          # salt is embedded in the Argon2 PHC string; column left empty
-            secret_question,
-            ans_hash,
-            "",          # same reason
-        ),
-)
+                """
+                INSERT INTO user_security
+                    (user_id, password_hash, secret_question, secret_answer_hash)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, pw_hash, secret_question, ans_hash),
+            )
         # Commit both inserts together as a single atomic transaction
         conn.commit()
         return (True, user_id)
@@ -321,7 +321,7 @@ def register_user(
     finally:
         # Always close the connection regardless of success or failure
         conn.close()
-
+        
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
