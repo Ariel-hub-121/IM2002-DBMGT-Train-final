@@ -1286,6 +1286,8 @@ STUB TO IMPLEMENT:
 
 SCHEMA (relevant tables only):
 [paste only the CREATE TABLE statements your function will query — trim the rest]
+<<<<<<< HEAD
+=======
 ```
 
 ### Code Review Prompt:
@@ -1418,4 +1420,5 @@ OUTPUT FORMAT:
 2. Show only the fixed code (complete function)
 3. Add a one-line comment on the line that was changed explaining what was wrong
 Do NOT rewrite parts that were already correct.
+>>>>>>> d4fef8621fe6f740e33745e8d4d058de73137dd9
 ```
