@@ -31,7 +31,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
-from datetime import datetime, timezone
+from decimal import Decimal
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 _ph = PasswordHasher()
