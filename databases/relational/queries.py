@@ -176,6 +176,49 @@ def query_national_rail_availability(
               FROM stop_origin  o
               JOIN stop_dest    d USING (schedule_id)
              WHERE d.dest_stop_order > o.origin_stop_order
+        ),
+
+        -- CTE 4: total physical seat capacity per schedule, computed once here
+        -- and referenced via JOIN so the three-table traversal does not execute
+        -- once per result row.
+        seat_counts AS (
+            SELECT nsl.schedule_id,
+                   COUNT(*) AS total_seats
+              FROM national_rail_seats        ns2
+              JOIN national_rail_coaches      nc  ON nc.coach_id   = ns2.coach_id
+              JOIN national_rail_seat_layouts nsl ON nsl.layout_id = nc.layout_id
+             GROUP BY nsl.schedule_id
+        ),
+
+        -- CTE 5: booked seats grouped by (schedule_id, departure_time) for the
+        -- requested date. Grouping by departure_time is critical: the same physical
+        -- seat can be booked on multiple departure times of the same schedule on the
+        -- same day (the unique index is on schedule+date+departure_time+seat_pk).
+        -- Summing across all departures would exceed total_seats and produce a
+        -- negative available_seats; grouping by departure keeps each seat counted
+        -- at most once per train run.
+        -- When travel_date is NULL, NULL::date comparisons never match, so this CTE
+        -- returns no rows — available_seats falls back to total_seats below. ✓
+        bookings_per_departure AS (
+            SELECT schedule_id,
+                   departure_time,
+                   COUNT(*) AS booked_count
+              FROM booking_tickets
+             WHERE travel_date = %s::date
+               AND status     != 'cancelled'
+               AND seat_pk    IS NOT NULL
+             GROUP BY schedule_id, departure_time
+        ),
+
+        -- CTE 6: peak booking load — the highest single-departure booking count
+        -- for each schedule on the requested date.
+        -- available_seats is based on this worst-case departure: if the busiest
+        -- train still has free seats, at least one departure has availability.
+        max_bookings AS (
+            SELECT schedule_id,
+                   MAX(booked_count) AS peak_booked
+              FROM bookings_per_departure
+             GROUP BY schedule_id
         )
 
         SELECT
@@ -194,44 +237,21 @@ def query_national_rail_availability(
             origin_stn.name   AS origin_station_name,
             dest_stn.name     AS destination_station_name,
 
-            -- Total seat capacity for this schedule across all coaches.
-            -- Traverses: national_rail_seats → national_rail_coaches
-            --            → national_rail_seat_layouts → national_rail_schedules.
-            -- This gives the physical seat count regardless of booking date.
-            COALESCE((
-                SELECT COUNT(*)
-                  FROM national_rail_seats      ns2
-                  JOIN national_rail_coaches    nc  ON nc.coach_id   = ns2.coach_id
-                  JOIN national_rail_seat_layouts nsl ON nsl.layout_id = nc.layout_id
-                 WHERE nsl.schedule_id = nrs.schedule_id
-            ), 0) AS total_seats,
+            COALESCE(sc.total_seats, 0) AS total_seats,
 
-            -- Available seats = total seats minus seats already booked on travel_date.
-            -- When travel_date is NULL, the booked_seats subquery returns 0 for every
-            -- schedule (NULL::date comparison is always NULL, COUNT returns 0), so
-            -- available_seats equals total_seats — correct behaviour for a date-free lookup.
-            COALESCE((
-                SELECT COUNT(*)
-                  FROM national_rail_seats      ns2
-                  JOIN national_rail_coaches    nc  ON nc.coach_id   = ns2.coach_id
-                  JOIN national_rail_seat_layouts nsl ON nsl.layout_id = nc.layout_id
-                 WHERE nsl.schedule_id = nrs.schedule_id
-            ), 0)
-            -
-            COALESCE((
-                -- Count non-cancelled tickets for this schedule on the requested date.
-                -- seat_pk IS NOT NULL ensures we only count tickets with an assigned seat
-                -- (not ticketless bookings), matching the schema's seat-uniqueness index.
-                SELECT COUNT(*)
-                  FROM booking_tickets bt
-                 WHERE bt.schedule_id  = nrs.schedule_id
-                   AND bt.travel_date  = %s::date
-                   AND bt.status      != 'cancelled'
-                   AND bt.seat_pk     IS NOT NULL
-            ), 0) AS available_seats
+            -- Conservative available-seat estimate: seats remaining on the
+            -- most-booked departure of the day.
+            -- GREATEST(..., 0) guards against data anomalies where booked_count
+            -- somehow exceeds physical capacity.
+            GREATEST(
+                COALESCE(sc.total_seats, 0) - COALESCE(mb.peak_booked, 0),
+                0
+            ) AS available_seats
 
-        FROM valid_schedules     vs
+        FROM valid_schedules vs
         JOIN national_rail_schedules nrs ON nrs.schedule_id = vs.schedule_id
+        LEFT JOIN seat_counts  sc  ON sc.schedule_id = nrs.schedule_id
+        LEFT JOIN max_bookings mb  ON mb.schedule_id = nrs.schedule_id
 
         -- Join to station master tables to resolve human-readable names.
         JOIN national_rail_stations origin_stn ON origin_stn.station_id = %s
@@ -248,15 +268,14 @@ def query_national_rail_availability(
     # Placeholders in order:
     #   1. stop_origin WHERE station_id = %s
     #   2. stop_dest   WHERE station_id = %s
-    #   3. total_seats subquery  (no parameter — counts all seats for the schedule)
-    #   4. booked_seats subquery travel_date = %s::date
-    #   5. origin_stn  JOIN      station_id = %s
-    #   6. dest_stn    JOIN      station_id = %s
-    #   7. (optional)  day_filter %s::date
+    #   3. bookings_per_departure WHERE travel_date = %s::date  (NULL-safe)
+    #   4. origin_stn  JOIN station_id = %s
+    #   5. dest_stn    JOIN station_id = %s
+    #   6. (optional)  day_filter_clause %s::date
     params = [
         origin_id,       # 1. stop_origin WHERE station_id = %s
         destination_id,  # 2. stop_dest   WHERE station_id = %s
-        travel_date,     # 3. booked_seats subquery: travel_date = %s::date (NULL-safe)
+        travel_date,     # 3. bookings_per_departure WHERE travel_date = %s::date
         origin_id,       # 4. origin station name JOIN
         destination_id,  # 5. destination station name JOIN
     ]
