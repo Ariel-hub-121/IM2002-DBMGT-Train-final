@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import random
 import string
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -44,15 +45,13 @@ def _connect():
     conn.autocommit = True
     return conn
 
-
 def _gen_booking_id() -> str:
-    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"BK-{suffix}"
-
+    # "BK-" + 8 hex chars = 11 characters, safely within VARCHAR(20)
+    return "BK-" + uuid.uuid4().hex[:8].upper()
 
 def _gen_payment_id() -> str:
-    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"PM-{suffix}"
+    # "PY-" + 8 hex chars = 11 characters, safely within VARCHAR(20)
+    return "PY-" + uuid.uuid4().hex[:8].upper()
 
 
 # ── Example ───────────────────────────────────────────────────────────────────
@@ -258,15 +257,16 @@ def execute_booking(
 
             departure_time = schedule["first_train_time"]
 
-            # ── 2. Count stops between origin and destination ──
+           # ── 2. Count stops between origin and destination ──
+            # First get the stop_order of both endpoints
             cur.execute(
                 """
                 SELECT station_id, stop_order
                 FROM national_rail_schedule_stops
                 WHERE schedule_id = %s
-                  AND station_id IN (%s, %s)
-                  AND is_stop = TRUE
-                  AND (effective_to IS NULL OR effective_to > CURRENT_DATE)
+                AND station_id IN (%s, %s)
+                AND is_stop = TRUE
+                AND effective_to IS NULL
                 ORDER BY stop_order
                 """,
                 (schedule_id, origin_station_id, destination_station_id),
@@ -275,8 +275,27 @@ def execute_booking(
             if len(stop_rows) != 2:
                 return (False, "Origin or destination station not found on this schedule")
 
-            stops_travelled = abs(stop_rows[1]["stop_order"] - stop_rows[0]["stop_order"])
+            origin_order = stop_rows[0]["stop_order"]
+            dest_order   = stop_rows[1]["stop_order"]
+            lo, hi       = min(origin_order, dest_order), max(origin_order, dest_order)
 
+            # Count only is_stop=TRUE stations between the two endpoints (exclusive of origin,
+            # inclusive of dest) — matches the stops_travelled definition used in fare queries.
+            # stop_order difference would overcount on express services that pass through
+            # non-stopping stations.
+            cur.execute(
+                """
+                SELECT COUNT(*) AS stops_travelled
+                FROM national_rail_schedule_stops
+                WHERE schedule_id  = %s
+                AND is_stop      = TRUE
+                AND effective_to IS NULL
+                AND stop_order   > %s
+                AND stop_order  <= %s
+                """,
+                (schedule_id, lo, hi),
+            )
+            stops_travelled = cur.fetchone()["stops_travelled"]
             # ── 3. Calculate fare ──
             # Keep psycopg2's Decimal return type throughout to avoid floating-point errors.
             # Decimal(stops_travelled) ensures multiplication stays in the Decimal domain.
@@ -455,14 +474,15 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             cur.execute(
                 """
                 SELECT to_.order_id, to_.amount_usd, to_.status,
-                       s.service_type
+                    s.service_type
                 FROM travel_orders to_
                 JOIN bookings b ON b.booking_id = to_.order_id
                 JOIN booking_tickets bt ON bt.booking_id = b.booking_id
                 JOIN national_rail_schedules s ON s.schedule_id = bt.schedule_id
                 WHERE to_.order_id = %s
-                  AND to_.user_id = %s
-                  AND to_.status = 'confirmed'
+                AND to_.user_id  = %s
+                AND to_.status   = 'confirmed'
+                AND bt.leg      != 'inbound'
                 LIMIT 1
                 """,
                 (booking_id, user_id),
@@ -603,8 +623,8 @@ def register_user(
     Register a new user.
     Returns (True, user_id) on success or (False, error_message) on failure.
 
-    NOTE: passwords are stored as plain text here intentionally for teaching
-    purposes. In production, replace with a salted hash (e.g. bcrypt).
+    Passwords are hashed with Argon2id before storage.
+    The salt is embedded in the PHC-format hash string — no separate salt column needed.
     """
     import uuid
 
@@ -615,7 +635,7 @@ def register_user(
     # Only year is provided, so default to Jan 1 of that year
     dob = f"{year_of_birth}-01-01"
 
-    # Hash password with Argon2id — salt is embedded in the output string (PHC format)
+    # Hash password with Argon2id — salt is embedded in the output PHC string
     pw_hash = _ph.hash(password)
     # Hash secret answer lowercase so verify_secret_answer can be case-insensitive
     ans_hash = _ph.hash(secret_answer.lower())
@@ -627,14 +647,20 @@ def register_user(
         with conn.cursor() as cur:
             # Insert basic user profile into the users table
             cur.execute(
-                "INSERT INTO users (user_id, full_name, email, date_of_birth) VALUES (%s, %s, %s, %s)",
+                """
+                INSERT INTO users (user_id, full_name, email, date_of_birth)
+                VALUES (%s, %s, %s, %s)
+                """,
                 (user_id, full_name, email, dob),
             )
-            # Insert hashed credentials into the security table
+            # Insert hashed credentials — salt columns omitted because
+            # Argon2id embeds the salt inside the PHC hash string
             cur.execute(
-                """INSERT INTO user_security
-                       (user_id, password_hash, secret_question, secret_answer_hash)
-                   VALUES (%s, %s, %s, %s)""",
+                """
+                INSERT INTO user_security
+                    (user_id, password_hash, secret_question, secret_answer_hash)
+                VALUES (%s, %s, %s, %s)
+                """,
                 (user_id, pw_hash, secret_question, ans_hash),
             )
         # Commit both inserts together as a single atomic transaction
@@ -647,8 +673,7 @@ def register_user(
     finally:
         # Always close the connection regardless of success or failure
         conn.close()
-
-
+        
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
@@ -695,7 +720,6 @@ def login_user(email: str, password: str) -> Optional[dict]:
         "is_active":     row["is_active"],
     }
 
-
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
     with _connect() as conn:
@@ -715,7 +739,6 @@ def get_user_secret_question(email: str) -> Optional[str]:
             row = dict(row) if row else None
 
     return row["secret_question"] if row else None
-
 
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
@@ -745,7 +768,6 @@ def verify_secret_answer(email: str, answer: str) -> bool:
     except VerifyMismatchError:
         return False
 
-
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
     # Hash the new password before storing
@@ -774,7 +796,7 @@ def update_password(email: str, new_password: str) -> bool:
         return False
     finally:
         conn.close()
-        
+                
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
 def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K) -> list[dict]:
