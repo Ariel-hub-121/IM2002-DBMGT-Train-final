@@ -31,6 +31,9 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+_ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
@@ -268,35 +271,180 @@ def register_user(
     Register a new user.
     Returns (True, user_id) on success or (False, error_message) on failure.
 
-    NOTE: passwords are stored as plain text here intentionally for teaching
-    purposes. In production, replace with a salted hash (e.g. bcrypt).
+    Passwords are hashed with Argon2id before storage.
+    The salt is embedded in the PHC-format hash string — no separate salt column needed.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    import uuid
 
+    # Generate a unique user ID using the first 8 hex chars of a UUID
+    user_id = "RU-" + uuid.uuid4().hex[:8].upper()
+    # Combine first and last name into a single full name string
+    full_name = f"{first_name} {surname}"
+    # Only year is provided, so default to Jan 1 of that year
+    dob = f"{year_of_birth}-01-01"
 
+    # Hash password with Argon2id — salt is embedded in the output PHC string
+    pw_hash = _ph.hash(password)
+    # Hash secret answer lowercase so verify_secret_answer can be case-insensitive
+    ans_hash = _ph.hash(secret_answer.lower())
+
+    # Open a direct connection for manual transaction control
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            # Insert basic user profile into the users table
+            cur.execute(
+                """
+                INSERT INTO users (user_id, full_name, email, date_of_birth)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, full_name, email, dob),
+            )
+            # Insert hashed credentials — salt columns omitted because
+            # Argon2id embeds the salt inside the PHC hash string
+            cur.execute(
+                """
+                INSERT INTO user_security
+                    (user_id, password_hash, secret_question, secret_answer_hash)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, pw_hash, secret_question, ans_hash),
+            )
+        # Commit both inserts together as a single atomic transaction
+        conn.commit()
+        return (True, user_id)
+    except Exception as e:
+        # Roll back all changes if anything goes wrong
+        conn.rollback()
+        return (False, str(e))
+    finally:
+        # Always close the connection regardless of success or failure
+        conn.close()
+        
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
     Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fetch user profile and stored password hash in one query
+            cur.execute(
+                """
+                SELECT u.user_id, u.email, u.full_name, u.phone,
+                       u.date_of_birth, u.is_active,
+                       us.password_hash
+                FROM users u
+                JOIN user_security us ON us.user_id = u.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+            # Convert to plain dict immediately while cursor is still open
+            row = dict(row) if row else None
 
+    # Return None if user not found
+    if not row:
+        return None
+
+    # Verify password against Argon2id hash — raises VerifyMismatchError on wrong password
+    try:
+        _ph.verify(row["password_hash"], password)
+    except VerifyMismatchError:
+        return None
+
+    # Split full_name back into first/surname for the required return shape
+    parts = (row["full_name"] or "").split(" ", 1)
+    return {
+        "user_id":       row["user_id"],
+        "email":         row["email"],
+        "full_name":     row["full_name"],
+        "first_name":    parts[0] if parts else "",
+        "surname":       parts[1] if len(parts) > 1 else "",
+        "phone":         row["phone"],
+        "date_of_birth": str(row["date_of_birth"]),
+        "is_active":     row["is_active"],
+    }
 
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Look up the secret question by matching email in users table
+            cur.execute(
+                """
+                SELECT us.secret_question
+                FROM user_security us
+                JOIN users u ON u.user_id = us.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+            # Convert to plain dict while cursor is still open
+            row = dict(row) if row else None
 
+    return row["secret_question"] if row else None
 
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fetch stored secret answer hash by matching email
+            cur.execute(
+                """
+                SELECT us.secret_answer_hash
+                FROM user_security us
+                JOIN users u ON u.user_id = us.user_id
+                WHERE u.email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+            # Convert to plain dict while cursor is still open
+            row = dict(row) if row else None
 
+    if not row or not row["secret_answer_hash"]:
+        return False
+
+    # Lowercase input matches how the answer was stored during registration
+    try:
+        _ph.verify(row["secret_answer_hash"], answer.lower())
+        return True
+    except VerifyMismatchError:
+        return False
 
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    # Hash the new password before storing
+    new_hash = _ph.hash(new_password)
 
-
+    # Open a direct connection for manual transaction control
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE user_security
+                SET password_hash = %s
+                FROM users u
+                WHERE user_security.user_id = u.user_id
+                  AND u.email = %s
+                """,
+                (new_hash, email),
+            )
+            updated = cur.rowcount
+        conn.commit()
+        return updated > 0
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+                
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
 def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K) -> list[dict]:
