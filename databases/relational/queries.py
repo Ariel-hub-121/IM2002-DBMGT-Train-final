@@ -300,11 +300,17 @@ def register_user(
             )
             # Insert hashed credentials into the security table
             cur.execute(
-                """INSERT INTO user_security
-                       (user_id, password_hash, secret_question, secret_answer_hash)
-                   VALUES (%s, %s, %s, %s)""",
-                (user_id, pw_hash, secret_question, ans_hash),
-            )
+            """INSERT INTO user_security (user_id, password_hash, password_salt, secret_question, secret_answer_hash, secret_answer_salt)
+            VALUES (%s, %s, %s, %s, %s, %s)""",
+            (
+                user_id,
+                pw_hash,
+            "",          # salt is embedded in the Argon2 PHC string; column left empty
+            secret_question,
+            ans_hash,
+            "",          # same reason
+        ),
+)
         # Commit both inserts together as a single atomic transaction
         conn.commit()
         return (True, user_id)
@@ -315,7 +321,6 @@ def register_user(
     finally:
         # Always close the connection regardless of success or failure
         conn.close()
-
 
 def login_user(email: str, password: str) -> Optional[dict]:
     """
@@ -363,7 +368,6 @@ def login_user(email: str, password: str) -> Optional[dict]:
         "is_active":     row["is_active"],
     }
 
-
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
     with _connect() as conn:
@@ -383,7 +387,6 @@ def get_user_secret_question(email: str) -> Optional[str]:
             row = dict(row) if row else None
 
     return row["secret_question"] if row else None
-
 
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
@@ -413,7 +416,6 @@ def verify_secret_answer(email: str, answer: str) -> bool:
     except VerifyMismatchError:
         return False
 
-
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
     # Hash the new password before storing
@@ -442,7 +444,7 @@ def update_password(email: str, new_password: str) -> bool:
         return False
     finally:
         conn.close()
-        
+                
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
 def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K) -> list[dict]:

@@ -12,5 +12,8 @@ requests>=2.31.0             # Ollama (local)
 # Web UI
 gradio>=4.36.0
 
+# Security
+argon2-cffi>=23.1.0          # Argon2id password hashing (required by user_security schema)
+
 # Utilities
 python-dotenv>=1.0.0         # Load .env file
