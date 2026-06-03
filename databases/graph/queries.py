@@ -276,7 +276,7 @@ def query_alternative_routes(
     Find paths between two stations that avoid a specific intermediate station.
 
     Useful for routing around a delayed or closed station.  The query finds all
-    simple paths (no repeated nodes) up to depth 15 that do not pass through
+    simple paths (no repeated nodes) up to depth 30 that do not pass through
     avoid_station_id, then returns the fastest ones.
 
     Note: the avoid constraint only applies to intermediate nodes — if
@@ -460,9 +460,8 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
     # so safe_hops (a validated Python int) is interpolated directly into the query.
     cypher = f"""
         MATCH (source:Station {{station_id: $station_id}})
-        MATCH path = (source)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..{safe_hops}]->
+        MATCH path = (source)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*0..{safe_hops}]->
                      (affected:Station)
-        WHERE affected <> source
         WITH affected, min(length(path)) AS hops_away
         RETURN DISTINCT
                affected.station_id AS station_id,
