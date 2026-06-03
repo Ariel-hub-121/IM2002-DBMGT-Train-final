@@ -652,6 +652,7 @@ def query_user_profile(user_email: str) -> Optional[dict]:
         "surname":       parts[1] if len(parts) > 1 else "",
         "phone":         row["phone"],
         "date_of_birth": str(row["date_of_birth"]) if row["date_of_birth"] else None,
+        "year_of_birth": row["date_of_birth"].year if row["date_of_birth"] else None,
         "registered_at": str(row["registered_at"]) if row["registered_at"] else None,
         "is_active":     row["is_active"],
     }
@@ -1072,6 +1073,7 @@ def execute_booking(
             "travel_date":             travel_date,
             "fare_class":              fare_class,
             "ticket_type":             ticket_type,
+            "seat_id":                 seat_code,
             "seat_code":               seat_code,
             "coach":                   coach,
             "stops_travelled":         stops_travelled,
