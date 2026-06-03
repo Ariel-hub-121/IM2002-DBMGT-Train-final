@@ -22,6 +22,7 @@ are already implemented — do not modify them.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import random
 import string
@@ -39,11 +40,15 @@ _ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
+@contextmanager
 def _connect():
-    """Return a new psycopg2 connection with autocommit enabled."""
+    """Context manager that yields an autocommit connection and closes it on exit."""
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = True
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def _gen_booking_id() -> str:
     # "BK-" + 8 hex chars = 11 characters, safely within VARCHAR(20)
@@ -534,14 +539,18 @@ def query_available_seats(
     schedule_id: str,
     travel_date: str,
     fare_class: str,
+    departure_time: Optional[str] = None,
 ) -> list[dict]:
     """
     Return available seats for a national rail journey on a given date.
 
     Args:
-        schedule_id:  e.g. "NR_SCH01"
-        travel_date:  e.g. "2025-06-01"
-        fare_class:   "standard" or "first"
+        schedule_id:    e.g. "NR_SCH01"
+        travel_date:    e.g. "2025-06-01"
+        fare_class:     "standard" or "first"
+        departure_time: e.g. "09:00" — when provided, only seats unbooked on
+                        that specific departure are excluded; when omitted, seats
+                        booked on ANY departure of the day are excluded (conservative).
 
     Returns:
         List of dicts: {seat_id, coach, row, column}
@@ -551,7 +560,7 @@ def query_available_seats(
             cur.execute(
                 """
                 SELECT
-                    s.seat_pk    AS seat_id,
+                    s.seat_code  AS seat_id,
                     c.coach_name AS coach,
                     s.seat_row   AS row,
                     s.seat_column AS column
@@ -565,12 +574,13 @@ def query_available_seats(
                       FROM   booking_tickets
                       WHERE  schedule_id = %s
                         AND  travel_date = %s
+                        AND  (departure_time = %s OR %s IS NULL)
                         AND  seat_pk IS NOT NULL
                         AND  status != 'cancelled'
                   )
                 ORDER BY c.coach_name, s.seat_row, s.seat_column
                 """,
-                (schedule_id, fare_class, schedule_id, travel_date),
+                (schedule_id, fare_class, schedule_id, travel_date, departure_time, departure_time),
             )
             return [dict(row) for row in cur.fetchall()]
 
@@ -840,6 +850,7 @@ def execute_booking(
     fare_class: str,
     seat_id: str,
     ticket_type: str = "single",
+    departure_time: Optional[str] = None,
 ) -> tuple[bool, dict | str]:
     """
     Create a national rail booking for a logged-in user.
@@ -853,6 +864,7 @@ def execute_booking(
         fare_class:             "standard" or "first"
         seat_id:                e.g. "B05" (or "any" to auto-assign)
         ticket_type:            "single" (default) or "return"
+        departure_time:         e.g. "09:00" — falls back to first_train_time if omitted
 
     Returns:
         (True, booking_dict)   on success
@@ -880,7 +892,8 @@ def execute_booking(
             if not schedule:
                 return (False, f"Schedule {schedule_id} not found or fare class {fare_class} unavailable")
 
-            departure_time = schedule["first_train_time"]
+            if departure_time is None:
+                departure_time = schedule["first_train_time"]
 
            # ── 2. Count stops between origin and destination ──
             # First get the stop_order of both endpoints
@@ -941,14 +954,15 @@ def execute_booking(
                       AND nc.fare_class = %s
                       AND ns.seat_pk NOT IN (
                           SELECT bt.seat_pk FROM booking_tickets bt
-                          WHERE bt.schedule_id = %s
-                            AND bt.travel_date = %s
-                            AND bt.status != 'cancelled'
+                          WHERE bt.schedule_id    = %s
+                            AND bt.travel_date    = %s
+                            AND bt.departure_time = %s
+                            AND bt.status        != 'cancelled'
                             AND bt.seat_pk IS NOT NULL
                       )
                     LIMIT 1
                     """,
-                    (schedule_id, fare_class, schedule_id, travel_date),
+                    (schedule_id, fare_class, schedule_id, travel_date, departure_time),
                 )
                 seat_row = cur.fetchone()
                 if not seat_row:
@@ -977,16 +991,17 @@ def execute_booking(
                 seat_code = seat_row["seat_code"]
                 coach     = seat_row["coach_name"]
 
-                # Confirm the seat is not already taken on this date
+                # Confirm the seat is not already taken on this departure
                 cur.execute(
                     """
                     SELECT 1 FROM booking_tickets
-                    WHERE schedule_id = %s
-                      AND travel_date = %s
-                      AND seat_pk = %s
-                      AND status != 'cancelled'
+                    WHERE schedule_id    = %s
+                      AND travel_date    = %s
+                      AND departure_time = %s
+                      AND seat_pk        = %s
+                      AND status        != 'cancelled'
                     """,
-                    (schedule_id, travel_date, seat_pk),
+                    (schedule_id, travel_date, departure_time, seat_pk),
                 )
                 if cur.fetchone():
                     return (False, f"Seat {seat_id} is already booked for {travel_date}")
