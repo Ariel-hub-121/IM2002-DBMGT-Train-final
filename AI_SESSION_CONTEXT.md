@@ -1277,6 +1277,22 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 - [x] query_national_rail_availability — available_seats 計算方式 (2026-06-02):
   - Decision: `available_seats = total_seats - MAX(同一 departure_time 的訂座數)`，而非 `total_seats - 當天所有班次訂座加總`。 Why: 同一物理座位在不同 departure_time 可各自被訂（uq_booking_tickets_seat 的 unique key 包含 departure_time），若直接加總全天訂座量會超過 total_seats 產生負數。以最繁忙班次的訂座量為基準，得到的是保守但永遠非負的可用座位估計。
   - Decision: stops_travelled 計算：national rail 用 COUNT(is_stop=TRUE) 實際站數（不是 stop_order 差值）；metro 用 dest_stop_sequence - origin_stop_sequence。 Why: 快車在某些站是 pass-through（is_stop=FALSE），若用 stop_order 差值會把通過站也計費；metro 無 pass-through 概念故可直接用序列差。
+- [x] `query_available_seats` (實作完成，2026-06-02):
+  - Decision: 回傳欄位 `seat_id` 對應資料庫的 `seat_pk`（BIGINT）。Why: stub 合約要求 `seat_id` 這個 key 名稱；`execute_booking` 接收的 `seat_id` 參數實際上就是 `seat_pk`，兩端保持一致。
+  - Decision: 子查詢排除條件為 `status != 'cancelled'`，未加 `departure_time` 篩選。Why: 函數簽名沒有 `departure_time` 參數，無法加入此條件；目前 mock data 每個 schedule 每天只有一個發車時間，不影響正確性。若未來簽名擴充才補上。
+  - Decision: 使用 `NOT IN` 子查詢而非 LEFT JOIN 過濾已佔用座位。Why: 資料量小，可讀性高；子查詢已有 `seat_pk IS NOT NULL` 保護，不會因 NULL 導致 `NOT IN` 邏輯錯誤。
+- [x] `query_user_profile` (實作完成，2026-06-02):
+  - Decision: `first_name` / `surname` 在應用層從 `full_name` 拆分（`.split(" ", 1)`），不存於 schema。Why: `users` 表只有 `full_name` 欄位，Python 層拆分避免 schema 異動；未來若新增獨立欄位可直接移除此邏輯。
+  - Decision: `date_of_birth` 與 `registered_at` 以 `str()` 轉換後回傳，`None` 時保持 `None`。Why: 避免呼叫端收到 `datetime.date` / `datetime.datetime` 物件導致 JSON 序列化失敗。
+  - Decision: 對 `full_name = None` 加 `or ""` 防禦性處理。Why: 雖然 schema 定義為 `NOT NULL`，防禦性寫法在資料異常時不會崩潰。
+- [x] `query_user_bookings` (實作完成，2026-06-02):
+  - Decision: Metro 查詢拆為三段：① 主購買記錄、② Day Pass 子旅程、③ Python 層合併，不使用 LEFT JOIN 一次展平。Why: LEFT JOIN 展平會讓父層欄位（`amount_usd`、`created_at` 等）在每筆子旅程上重複出現，Python 合併後結構為巢狀，呼叫端不需自行 group。
+  - Decision: Day Pass 子旅程使用 `WHERE dpt.purchase_id = ANY(%s)` 批次查詢。Why: 避免 N+1 查詢；`ANY(%s)` 傳入 Python list，psycopg2 自動轉為 PostgreSQL array，空 list 也能正常處理。
+  - Decision: 組裝子旅程時使用 `r.pop("purchase_id")` 取出 key 並同時從 dict 移除。Why: `purchase_id` 只作為 Python groupby 的 key，不應出現在子旅程 dict 裡，避免前端收到重複欄位。
+  - Decision: National Rail 查詢的 SELECT 清單包含 `bt.travelled_at`。Why: 呼叫端需判斷票是否已搭乘；僅靠 `status = 'completed'` 無法得知實際搭乘時間。
+- [x] `query_payment_info` (實作完成，2026-06-02):
+  - Decision: 使用兩段式查詢（先查 `national_rail_booking_id`，查無再查 `metro_trip_id`），不使用 `OR` 單一查詢。Why: `OR` 在 ID 字串恰好跨欄碰撞時會命中兩筆記錄，`fetchone()` 只取第一筆導致回傳錯誤付款資料；兩段式查詢從根本消除此風險，且不依賴 BK/MT 前綴命名假設。
+  - Decision: 兩次 `fetchone()` 均做 `if row else None` 的 None 檢查後才呼叫 `dict()`。Why: 查無記錄時 `fetchone()` 回傳 `None`，直接呼叫 `dict(None)` 會崩潰。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
