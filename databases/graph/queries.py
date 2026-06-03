@@ -383,7 +383,7 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
             "origin_id": origin_id,
             "destination_id": destination_id,
             "total_time_min": None,
-            "stations": [],
+            "path": [],
             "legs": [],
             "interchange_points": [],
         }
@@ -402,7 +402,7 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
         "origin_id": origin_id,
         "destination_id": destination_id,
         "total_time_min": rec["weight"],
-        "stations": stations,
+        "path": stations,
         "legs": legs,
         "interchange_points": interchange_points,
     }
@@ -462,6 +462,7 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
         MATCH (source:Station {{station_id: $station_id}})
         MATCH path = (source)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..{safe_hops}]->
                      (affected:Station)
+        WHERE affected <> source
         WITH affected, min(length(path)) AS hops_away
         RETURN DISTINCT
                affected.station_id AS station_id,
