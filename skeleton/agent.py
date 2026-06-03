@@ -428,7 +428,7 @@ def _execute_tool(
                 avoid_station_id=params["avoid_station_id"],
                 network=params.get("network", "auto"),
             )
-            result = [{"route_number": i + 1, "legs": r} for i, r in enumerate(routes)]
+            result = [{"route_number": i + 1, **r} for i, r in enumerate(routes)]
 
         elif tool_name == "get_delay_ripple":
             result = query_delay_ripple(

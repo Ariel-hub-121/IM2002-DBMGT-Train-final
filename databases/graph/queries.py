@@ -205,13 +205,14 @@ def query_cheapest_route(
     # because APOC dijkstra only accepts a single property name as the edge weight.
     # Fare depends on both relationship type AND fare_class, so we must compute it
     # inline in Cypher using CASE expressions with $fare_class as a parameter.
+    rel_str = _rel_types(origin_id, destination_id, network)
     with _driver() as driver:
         with driver.session() as session:
             rec = session.run(
-                """
-                MATCH (origin:Station {station_id: $origin_id})
-                MATCH (dest:Station   {station_id: $dest_id})
-                MATCH path = (origin)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..15]->(dest)
+                f"""
+                MATCH (origin:Station {{station_id: $origin_id}})
+                MATCH (dest:Station   {{station_id: $dest_id}})
+                MATCH path = (origin)-[:{rel_str}*1..15]->(dest)
                 // Reject paths that visit the same node twice (no cycles)
                 WHERE all(n IN nodes(path) WHERE single(x IN nodes(path) WHERE x = n))
                 WITH path,
@@ -297,13 +298,14 @@ def query_alternative_routes(
           legs             list[dict]
           path             list[dict]
     """
+    rel_str = _rel_types(origin_id, destination_id, network)
     with _driver() as driver:
         with driver.session() as session:
             records = list(session.run(
-                """
-                MATCH (origin:Station {station_id: $origin_id})
-                MATCH (dest:Station   {station_id: $dest_id})
-                MATCH path = (origin)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..15]->(dest)
+                f"""
+                MATCH (origin:Station {{station_id: $origin_id}})
+                MATCH (dest:Station   {{station_id: $dest_id}})
+                MATCH path = (origin)-[:{rel_str}*1..15]->(dest)
                 WHERE
                   // Allow origin/dest to equal avoid_id (degenerate input) but block
                   // any intermediate node that matches, since those are the "closed" stops.
