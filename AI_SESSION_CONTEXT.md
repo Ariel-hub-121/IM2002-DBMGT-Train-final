@@ -1228,7 +1228,12 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
-- [ ] Schema design: TODO — add your table/column decisions here
+- [x] Schema design (已完成，詳見 databases/relational/schema.sql):
+  - Decision: PK 採用 VARCHAR business ID（如 "U001", "NR01"）給有業務意義的欄位，BIGSERIAL/SERIAL 給無自然 key 的內部記錄（如 seat_pk, coach_id, ticket_id）。 Why: VARCHAR ID 保留可讀性；BIGSERIAL 整數 FK join 效能優於 VARCHAR；不用 UUID 因為不需要分散式唯一性。
+  - Decision: 刪除策略採混合模式。users 用 soft delete（is_active=FALSE），保留歷史訂單審計軌跡；訂單子層資料（booking_tickets 等）用 ON DELETE CASCADE；booking_tickets.seat_pk 用 ON DELETE SET NULL（座位退役時保留票務記錄）；travel_orders.user_id 用 ON DELETE RESTRICT（強制先 soft delete）。 Why: 財務記錄不能因帳號刪除而消失；每個 FK 都明確宣告行為，不依賴資料庫預設值。
+  - Decision: national_rail_schedule_stops 有 is_stop 欄位區分「實際停靠」與「通過不停」（快車）。 Why: 票價計算以 is_stop=TRUE 的站數為準，快車通過中間站不計費。
+  - Decision: 密碼使用 Argon2id（PHC format），存在獨立的 user_security 表。 Why: PHC format 將 salt 嵌入 hash 字串，不需要獨立 salt 欄位；user_security 獨立避免一般查詢意外曝露 hash。
+  - Decision: booking_tickets 有部分唯一索引 uq_booking_tickets_seat on (schedule_id, travel_date, departure_time, seat_pk) WHERE seat_pk IS NOT NULL AND status != 'cancelled'。 Why: 同一物理座位在同一班次同一時刻只能被一個有效訂票佔用；cancelled 排除讓座位可重新被訂。
 - [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-30):
   - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
   - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
@@ -1236,6 +1241,42 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: RAIL_LINK fare 屬性採用 8 欄位（normal/express × standard/first），而非 4 欄位。 Why: 國鐵同一條路線同時有普通車與快車兩種 service_type，票價不同；將兩者展開在同一條邊，query_cheapest_route 可直接用 `r.normal_standard_fare_usd` 或 `r.express_standard_fare_usd` 取值，不需要額外 JOIN 或條件分支查另一張表。
   - Decision: Node properties 為 `station_id`（與 PostgreSQL PK 完全一致）、`name`、`lines`（原生 Neo4j 陣列）。 Why: station_id 對齊保證跨資料庫查詢正確；lines 存為陣列可用 "M1" IN s.lines 高效過濾。
   - Decision: 全部使用 MERGE 不用 CREATE（idempotent）。 Why: 開發期間會多次重新 seed，MERGE 確保安全重跑。
+- [x] PostgreSQL seeding (已在 seed_postgres.py 全部實作，2026-05-31):
+  **執行順序與 FK 依賴**
+  - Decision: 執行順序固定為 `seed_metro_stations → seed_national_rail_stations → seed_metro_schedules → seed_national_rail_schedules → seed_seat_layouts → seed_users → seed_national_rail_bookings → seed_metro_travels → seed_payments → seed_feedback`。`metro_rail_interchanges` 放在 `seed_national_rail_stations` 結尾插入，而非 `seed_metro_stations` 中。Why: FK 約束強制此順序；`metro_rail_interchanges` 同時有指向捷運站和國鐵站的 FK，必須等兩個父表都存在才能插入。
+  **Idempotency 策略**
+  - Decision: 一般表使用通用 `insert_many`（內含 `ON CONFLICT DO NOTHING`）。`booking_tickets` 無業務唯一鍵（`SERIAL` PK），改用預先查詢過濾已存在的 `booking_id`。`national_rail_schedule_stops`、`national_rail_coaches`、`national_rail_seats` 各自指定明確的衝突目標（如 `ON CONFLICT (layout_id, coach_name) DO NOTHING`）。Why: 評分規範要求重複執行不得失敗或產生重複資料；無唯一目標的 `ON CONFLICT DO NOTHING` 在有多個 unique index 時行為不明確，必須明確指定。
+  **`travel_orders` 共用父表設計**
+  - Decision: 國鐵訂單（`BK…`）和捷運購票（`MT…`）都在 `travel_orders` 各有一列，以 `order_type = 'national_rail'` 或 `'metro'` 區分。JSON 的 `booked_at` / `purchased_at` 對應到 schema 的 `created_at`。Why: `query_user_bookings` 必須回傳 `{"national_rail": [...], "metro": [...]}`；共用父表讓單一 JOIN 可取得使用者的全部訂單，不需分兩次查詢。
+  **JSON 欄位名稱 → Schema 欄位名稱對應**
+  - Decision: 以下欄位在 seeding 時更名，**AI 生成查詢時一律使用 schema 欄位名稱**：
+    | JSON 欄位 | Schema 欄位 | 所在資料表 |
+    |---|---|---|
+    | `line` | `line_name` | `metro_schedules`、`national_rail_schedules` |
+    | `destination_station_id` | `dest_station_id` | `metro_schedules` |
+    | `booked_at` / `purchased_at` | `created_at` | `travel_orders` |
+    | `booking_id` | `order_id` | `customer_feedback` |
+    | `seat_id` | `seat_code` | `booking_tickets` |
+    Why: Schema 欄位已正規化命名；直接用 JSON key 生成查詢會用到不存在的欄位名稱。
+  **`booking_tickets.leg` 推導規則**
+  - Decision: `bookings.json` 無 `leg` 欄位，seeder 自行推導：`ticket_type='single'` → `leg='single'`；`ticket_type='return'` → `leg='outbound'`（mock data 只有去程記錄）；其他值立即拋出 `ValueError`。Why: Schema `CHECK` 約束要求 `leg` 必須是 `('single', 'outbound', 'inbound')` 之一且與 `ticket_type` 一致；靜默填錯會導致退票政策計算出錯。
+  **已取消訂單的 `cancelled_at` 替代值**
+  - Decision: `status='cancelled'` 的訂單，`cancelled_at` 以 `booked_at` 代替（`bookings.json` 無此欄位）；其他狀態設 `NULL`。Why: Schema `CHECK` 約束（`chk_cancelled_at_consistency`）要求取消訂單的 `cancelled_at IS NOT NULL`；`booked_at` 是最保守的替代值。注意：`execute_cancellation()` 執行期會記錄真實取消時間戳，此處僅為 seed 資料的近似值。
+  **`national_rail_coaches` / `national_rail_seats` BIGSERIAL PK 查回策略**
+  - Decision: 插入 coaches 後，立即透過三表 JOIN（`seats → coaches → layouts`）查回 DB 生成的 `coach_id`，再用於建立 seats 的 FK。若有任何 `(layout_id, coach_name)` 查不回來，立即 `RuntimeError`。Why: coach 名稱只在同一 layout 內唯一、seat code 只在同一 coach 內唯一，因此使用 BIGSERIAL 代理鍵；`execute_values` 不回傳自動生成的 ID，必須主動 SELECT；提早失敗比讓 `KeyError` 在 list comprehension 內部爆掉更好 debug。
+  **捷運日票記錄的分流邏輯**
+  - Decision: `metro_travel_history.json` 中 `day_pass_ref=None` 的記錄為購票事件，插入 `travel_orders` + `metro_trip_purchases`；`day_pass_ref` 有值的記錄為日票下的單次搭乘，只插入 `metro_day_pass_trips`，不新增 `travel_orders`。Why: 一張日票對應一筆 `travel_orders`（一次付款），旗下每次搭乘是獨立的 trip 記錄；若搭乘記錄也建 `travel_orders` 會造成重複計費資料。
+  **日票搭乘 `stops_travelled` 計算與資料一致性驗證**
+  - Decision: 日票搭乘記錄無 `stops_travelled`，seeder 從 `metro_schedules.json` 建立 `(schedule_id, station_id) → stop_sequence` 對應表，計算 `abs(dest_seq - origin_seq)`；跨線搭乘找不到序號時填 `0` 作為哨兵值。插入前會驗證此對應表與 DB 的 `metro_schedule_stops` 完全一致，不一致即 `RuntimeError`。Why: 票價公式 `base_fare + per_stop_rate × stops_travelled` 依賴此欄位；`0` 滿足 `CHECK (stops_travelled >= 0)` 且可辨識為「路線資料不足」而非真正零站搭乘；驗證步驟防止 JSON 與 DB 無聲地不同步。
+  **`payment_sources` 來源類型判斷**
+  - Decision: `booking_id` 前綴 `BK…` → `source_type='national_rail_booking'`；其他（如 `MT…`）→ `source_type='metro_trip'`；對應 FK 欄設值，另一欄設 `NULL`。Why: Schema `CHECK` 約束要求兩個 FK 欄位恰好一個非 `NULL`；ID 前綴是 mock data 中唯一的來源區分依據。
+  **`customer_feedback` 不存 `user_id`；`feedback_comments` 獨立子表**
+  - Decision: `customer_feedback` 不含 `user_id` 欄位，需要時透過 JOIN `travel_orders` 取得。`feedback_comments` 獨立為 1:1 子表，只在來源 JSON 的 `comment` 非 `NULL` 時插入。Why: 避免 `user_id` 在兩表重複儲存造成不一致；comment 獨立存放讓純評分聚合查詢不需掃描 TEXT 欄位。
+  **密碼 Argon2id hash；重跑 seeder 只處理新使用者**
+  - Decision: `user_security` 以 Argon2id hash 儲存密碼與密保答案。重跑 seeder 時先查詢已存在的 `user_id`，只對新使用者執行 hash，已有記錄的跳過。Why: Argon2id 刻意設計為耗時（防暴力破解）；若每次全部重新 hash 會讓 seeder 重跑過慢；mock data 密碼在執行間不變，跳過安全。
+- [x] query_national_rail_availability — available_seats 計算方式 (2026-06-02):
+  - Decision: `available_seats = total_seats - MAX(同一 departure_time 的訂座數)`，而非 `total_seats - 當天所有班次訂座加總`。 Why: 同一物理座位在不同 departure_time 可各自被訂（uq_booking_tickets_seat 的 unique key 包含 departure_time），若直接加總全天訂座量會超過 total_seats 產生負數。以最繁忙班次的訂座量為基準，得到的是保守但永遠非負的可用座位估計。
+  - Decision: stops_travelled 計算：national rail 用 COUNT(is_stop=TRUE) 實際站數（不是 stop_order 差值）；metro 用 dest_stop_sequence - origin_stop_sequence。 Why: 快車在某些站是 pass-through（is_stop=FALSE），若用 stop_order 差值會把通過站也計費；metro 無 pass-through 概念故可直接用序列差。
 - [x] `query_available_seats` (實作完成，2026-06-02):
   - Decision: 回傳欄位 `seat_id` 對應資料庫的 `seat_pk`（BIGINT）。Why: stub 合約要求 `seat_id` 這個 key 名稱；`execute_booking` 接收的 `seat_id` 參數實際上就是 `seat_pk`，兩端保持一致。
   - Decision: 子查詢排除條件為 `status != 'cancelled'`，未加 `departure_time` 篩選。Why: 函數簽名沒有 `departure_time` 參數，無法加入此條件；目前 mock data 每個 schedule 每天只有一個發車時間，不影響正確性。若未來簽名擴充才補上。
@@ -1294,8 +1335,6 @@ STUB TO IMPLEMENT:
 
 SCHEMA (relevant tables only):
 [paste only the CREATE TABLE statements your function will query — trim the rest]
-<<<<<<< HEAD
-=======
 ```
 
 ### Code Review Prompt:
@@ -1428,5 +1467,4 @@ OUTPUT FORMAT:
 2. Show only the fixed code (complete function)
 3. Add a one-line comment on the line that was changed explaining what was wrong
 Do NOT rewrite parts that were already correct.
->>>>>>> d4fef8621fe6f740e33745e8d4d058de73137dd9
 ```
