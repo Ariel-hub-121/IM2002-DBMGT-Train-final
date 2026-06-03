@@ -1228,7 +1228,12 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
-- [ ] Schema design: TODO — add your table/column decisions here
+- [x] Schema design (已完成，詳見 databases/relational/schema.sql):
+  - Decision: PK 採用 VARCHAR business ID（如 "U001", "NR01"）給有業務意義的欄位，BIGSERIAL/SERIAL 給無自然 key 的內部記錄（如 seat_pk, coach_id, ticket_id）。 Why: VARCHAR ID 保留可讀性；BIGSERIAL 整數 FK join 效能優於 VARCHAR；不用 UUID 因為不需要分散式唯一性。
+  - Decision: 刪除策略採混合模式。users 用 soft delete（is_active=FALSE），保留歷史訂單審計軌跡；訂單子層資料（booking_tickets 等）用 ON DELETE CASCADE；booking_tickets.seat_pk 用 ON DELETE SET NULL（座位退役時保留票務記錄）；travel_orders.user_id 用 ON DELETE RESTRICT（強制先 soft delete）。 Why: 財務記錄不能因帳號刪除而消失；每個 FK 都明確宣告行為，不依賴資料庫預設值。
+  - Decision: national_rail_schedule_stops 有 is_stop 欄位區分「實際停靠」與「通過不停」（快車）。 Why: 票價計算以 is_stop=TRUE 的站數為準，快車通過中間站不計費。
+  - Decision: 密碼使用 Argon2id（PHC format），存在獨立的 user_security 表。 Why: PHC format 將 salt 嵌入 hash 字串，不需要獨立 salt 欄位；user_security 獨立避免一般查詢意外曝露 hash。
+  - Decision: booking_tickets 有部分唯一索引 uq_booking_tickets_seat on (schedule_id, travel_date, departure_time, seat_pk) WHERE seat_pk IS NOT NULL AND status != 'cancelled'。 Why: 同一物理座位在同一班次同一時刻只能被一個有效訂票佔用；cancelled 排除讓座位可重新被訂。
 - [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-30):
   - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
   - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
@@ -1269,6 +1274,9 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: `customer_feedback` 不含 `user_id` 欄位，需要時透過 JOIN `travel_orders` 取得。`feedback_comments` 獨立為 1:1 子表，只在來源 JSON 的 `comment` 非 `NULL` 時插入。Why: 避免 `user_id` 在兩表重複儲存造成不一致；comment 獨立存放讓純評分聚合查詢不需掃描 TEXT 欄位。
   **密碼 Argon2id hash；重跑 seeder 只處理新使用者**
   - Decision: `user_security` 以 Argon2id hash 儲存密碼與密保答案。重跑 seeder 時先查詢已存在的 `user_id`，只對新使用者執行 hash，已有記錄的跳過。Why: Argon2id 刻意設計為耗時（防暴力破解）；若每次全部重新 hash 會讓 seeder 重跑過慢；mock data 密碼在執行間不變，跳過安全。
+- [x] query_national_rail_availability — available_seats 計算方式 (2026-06-02):
+  - Decision: `available_seats = total_seats - MAX(同一 departure_time 的訂座數)`，而非 `total_seats - 當天所有班次訂座加總`。 Why: 同一物理座位在不同 departure_time 可各自被訂（uq_booking_tickets_seat 的 unique key 包含 departure_time），若直接加總全天訂座量會超過 total_seats 產生負數。以最繁忙班次的訂座量為基準，得到的是保守但永遠非負的可用座位估計。
+  - Decision: stops_travelled 計算：national rail 用 COUNT(is_stop=TRUE) 實際站數（不是 stop_order 差值）；metro 用 dest_stop_sequence - origin_stop_sequence。 Why: 快車在某些站是 pass-through（is_stop=FALSE），若用 stop_order 差值會把通過站也計費；metro 無 pass-through 概念故可直接用序列差。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
@@ -1311,4 +1319,136 @@ STUB TO IMPLEMENT:
 
 SCHEMA (relevant tables only):
 [paste only the CREATE TABLE statements your function will query — trim the rest]
+```
+
+### Code Review Prompt:
+```
+Review this Python database function from the TransitFlow project against 
+the stub contract and schema below.
+
+Check ALL of the following — report only real bugs, not style suggestions:
+
+CORRECTNESS CHECKS:
+1. Table & column names — does it use ONLY names that exist in the schema below?
+   Flag any invented column or table name.
+
+2. Return type & shape — does it match the stub's return type exactly?
+   - list-returning functions must return [] (not None) when no rows found
+   - Optional[dict]-returning functions must return None (not []) when not found
+   - execute_ functions must return (True, dict) on success and (False, str) on failure
+   - query_user_bookings must always return {"national_rail": [...], "metro": [...]}
+     — both keys must be present even when empty
+
+3. Connection pattern — does it follow this exact pattern for read-only functions?
+     with _connect() as conn:
+         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+             cur.execute(...)
+             return [dict(row) for row in cur.fetchall()]  # or fetchone()
+   Flag if _connect() is missing, RealDictCursor is missing, or rows are not 
+   converted to dict.
+
+4. Write operation pattern — for execute_ functions only:
+   - Must NOT use _connect() — must use psycopg2.connect(PG_DSN) directly
+   - Must set conn.autocommit = False
+   - ALL inserts (e.g. travel_orders + bookings + booking_tickets + payments) 
+     must be committed in a single conn.commit() — not separate commits
+   - Must have conn.rollback() in the except branch
+   - Must return (False, error_string) on failure, never raise
+
+5. SQL injection — are ALL user-supplied values passed as %s parameters?
+   Flag any value concatenated directly into the SQL string.
+
+6. Empty-result handling — does fetchone() result get checked for None before 
+   calling dict() on it? A bare dict(cur.fetchone()) will crash if no row found.
+
+7. Two-network logic (national rail vs metro):
+   - National rail bookings use: travel_orders → bookings → booking_tickets
+   - Metro purchases use: travel_orders → metro_trip_purchases
+   - Day pass journeys use: metro_day_pass_trips (child of metro_trip_purchases)
+   Flag if the wrong tables are used for the wrong network.
+
+8. Fare arithmetic — if fare is calculated in Python, verify:
+   total_fare_usd = base_fare_usd + (per_stop_rate_usd × stops_travelled)
+   Flag if the formula is wrong or if fare is calculated in the wrong currency type.
+
+9. Auth functions only — password handling:
+   - Plain-text password storage = critical bug
+   - Must use argon2 ph.hash() to store, ph.verify() to check
+   - login_user must return None (not raise) on wrong password
+
+10. Refund logic (execute_cancellation only):
+    - Normal service → RF001: 100% if ≥48h, 75% if 24–48h, 50% if 2–24h, 0% if <2h
+    - Express service → RF002: 100% if ≥48h, 50% if 24–48h, 0% if <24h
+    - Must use the booking's scheduled departure_time + travel_date to calculate 
+      hours_before_departure, not the current date alone
+    Flag if the wrong policy is applied or if the time calculation is incorrect.
+
+STUB (the contract):
+[paste the original stub]
+
+IMPLEMENTATION TO REVIEW:
+[paste your code]
+
+SCHEMA (relevant tables only):
+[paste relevant CREATE TABLE statements]
+```
+### Debugging Prompt
+```
+I have a bug in a Python database function from the TransitFlow project.
+Help me fix it without changing the function's signature, return type, or logic 
+that is already correct.
+
+ERROR INFORMATION:
+Full traceback:
+[paste the full traceback]
+
+ERROR TYPE (check one):
+[ ] Runtime crash (exception raised during execution)
+[ ] Wrong data returned (no crash but result is incorrect)
+[ ] Transaction not committed (data not saved to database)
+[ ] Silent failure (returns [] or None when data should exist)
+
+FUNCTION WITH BUG:
+[paste your code]
+
+ORIGINAL STUB (the contract this function must satisfy):
+[paste the original stub]
+
+SCHEMA (relevant tables only):
+[paste relevant CREATE TABLE statements]
+
+WHAT I EXPECTED:
+[one sentence for example：
+"Should return a list of available seats for schedule NR_SCH01 on 2026-05-01
+in standard class, but it returns an empty list instead."]
+
+WHAT ACTUALLY HAPPENED:
+[one sentence for example：
+"Returns [] even though the database has confirmed seats for that date."]
+
+CONSTRAINTS — the fix must:
+1. Keep the same function signature (parameter names, return type)
+2. Use only table/column names that exist in the schema above
+3. Use _connect() + RealDictCursor for read-only functions
+   OR psycopg2.connect(PG_DSN) with manual commit/rollback for execute_ functions
+4. Return [] not None for list-returning functions when no rows found
+5. Return None not [] for Optional[dict]-returning functions when not found
+6. Keep ALL user inputs as %s parameters — no f-strings in SQL
+
+KNOWN PROJECT-SPECIFIC PITFALLS (check if any apply to this bug):
+[ ] fetchone() called without checking for None first
+[ ] Two tables joined in wrong order (national rail vs metro tables mixed up)
+[ ] Fare formula wrong: should be base_fare + (per_stop_rate × stops_travelled)
+[ ] execute_ function used _connect() instead of psycopg2.connect(PG_DSN)
+[ ] Multiple conn.commit() calls instead of one atomic commit
+[ ] Password stored as plain text instead of argon2 hash
+[ ] Refund hours calculated from today's date instead of scheduled departure datetime
+[ ] stop_order / stop_sequence used incorrectly to determine direction of travel
+[ ] Day pass trips queried from metro_trip_purchases instead of metro_day_pass_trips
+
+OUTPUT FORMAT:
+1. Identify the root cause in one sentence
+2. Show only the fixed code (complete function)
+3. Add a one-line comment on the line that was changed explaining what was wrong
+Do NOT rewrite parts that were already correct.
 ```
