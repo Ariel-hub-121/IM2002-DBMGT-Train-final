@@ -25,12 +25,14 @@ from __future__ import annotations
 import json
 import random
 import string
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
 
+from decimal import Decimal
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 _ph = PasswordHasher()
@@ -43,15 +45,13 @@ def _connect():
     conn.autocommit = True
     return conn
 
-
 def _gen_booking_id() -> str:
-    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"BK-{suffix}"
-
+    # "BK-" + 8 hex chars = 11 characters, safely within VARCHAR(20)
+    return "BK-" + uuid.uuid4().hex[:8].upper()
 
 def _gen_payment_id() -> str:
-    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"PM-{suffix}"
+    # "PY-" + 8 hex chars = 11 characters, safely within VARCHAR(20)
+    return "PY-" + uuid.uuid4().hex[:8].upper()
 
 
 # ── Example ───────────────────────────────────────────────────────────────────
@@ -206,7 +206,6 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
 
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
-
 def execute_booking(
     user_id: str,
     schedule_id: str,
@@ -234,16 +233,229 @@ def execute_booking(
         (True, booking_dict)   on success
         (False, error_message) on failure
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    # Open a manual-commit connection so booking + payment are atomic
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # ── 1. Look up the schedule to get departure time and service type ──
+            cur.execute(
+                """
+                SELECT s.first_train_time, s.service_type,
+                       f.base_fare_usd, f.per_stop_rate_usd
+                FROM national_rail_schedules s
+                JOIN national_rail_schedule_fares f
+                  ON f.schedule_id = s.schedule_id AND f.fare_class = %s
+                WHERE s.schedule_id = %s
+                """,
+                (fare_class, schedule_id),
+            )
+            schedule = cur.fetchone()
+            if not schedule:
+                return (False, f"Schedule {schedule_id} not found or fare class {fare_class} unavailable")
+
+            departure_time = schedule["first_train_time"]
+
+           # ── 2. Count stops between origin and destination ──
+            # First get the stop_order of both endpoints
+            cur.execute(
+                """
+                SELECT station_id, stop_order
+                FROM national_rail_schedule_stops
+                WHERE schedule_id = %s
+                AND station_id IN (%s, %s)
+                AND is_stop = TRUE
+                AND effective_to IS NULL
+                ORDER BY stop_order
+                """,
+                (schedule_id, origin_station_id, destination_station_id),
+            )
+            stop_rows = cur.fetchall()
+            if len(stop_rows) != 2:
+                return (False, "Origin or destination station not found on this schedule")
+
+            origin_order = stop_rows[0]["stop_order"]
+            dest_order   = stop_rows[1]["stop_order"]
+            lo, hi       = min(origin_order, dest_order), max(origin_order, dest_order)
+
+            # Count only is_stop=TRUE stations between the two endpoints (exclusive of origin,
+            # inclusive of dest) — matches the stops_travelled definition used in fare queries.
+            # stop_order difference would overcount on express services that pass through
+            # non-stopping stations.
+            cur.execute(
+                """
+                SELECT COUNT(*) AS stops_travelled
+                FROM national_rail_schedule_stops
+                WHERE schedule_id  = %s
+                AND is_stop      = TRUE
+                AND effective_to IS NULL
+                AND stop_order   > %s
+                AND stop_order  <= %s
+                """,
+                (schedule_id, lo, hi),
+            )
+            stops_travelled = cur.fetchone()["stops_travelled"]
+            # ── 3. Calculate fare ──
+            # Keep psycopg2's Decimal return type throughout to avoid floating-point errors.
+            # Decimal(stops_travelled) ensures multiplication stays in the Decimal domain.
+            base_fare     = schedule["base_fare_usd"]        # Decimal
+            per_stop_rate = schedule["per_stop_rate_usd"]    # Decimal
+            total_fare    = base_fare + per_stop_rate * Decimal(stops_travelled)
+
+            # ── 4. Resolve seat: look up seat_pk from seat_code ──
+            if seat_id.lower() == "any":
+                # Auto-assign: pick first available seat in the correct fare class coach
+                cur.execute(
+                    """
+                    SELECT ns.seat_pk, ns.seat_code, nc.coach_name
+                    FROM national_rail_seats ns
+                    JOIN national_rail_coaches nc ON nc.coach_id = ns.coach_id
+                    JOIN national_rail_seat_layouts nl ON nl.layout_id = nc.layout_id
+                    WHERE nl.schedule_id = %s
+                      AND nc.fare_class = %s
+                      AND ns.seat_pk NOT IN (
+                          SELECT bt.seat_pk FROM booking_tickets bt
+                          WHERE bt.schedule_id = %s
+                            AND bt.travel_date = %s
+                            AND bt.status != 'cancelled'
+                            AND bt.seat_pk IS NOT NULL
+                      )
+                    LIMIT 1
+                    """,
+                    (schedule_id, fare_class, schedule_id, travel_date),
+                )
+                seat_row = cur.fetchone()
+                if not seat_row:
+                    return (False, "No available seats for the requested class")
+                seat_pk   = seat_row["seat_pk"]
+                seat_code = seat_row["seat_code"]
+                coach     = seat_row["coach_name"]
+            else:
+                # Use the requested seat_id (seat_code)
+                cur.execute(
+                    """
+                    SELECT ns.seat_pk, ns.seat_code, nc.coach_name
+                    FROM national_rail_seats ns
+                    JOIN national_rail_coaches nc ON nc.coach_id = ns.coach_id
+                    JOIN national_rail_seat_layouts nl ON nl.layout_id = nc.layout_id
+                    WHERE nl.schedule_id = %s
+                      AND nc.fare_class = %s
+                      AND ns.seat_code = %s
+                    """,
+                    (schedule_id, fare_class, seat_id),
+                )
+                seat_row = cur.fetchone()
+                if not seat_row:
+                    return (False, f"Seat {seat_id} not found in {fare_class} class for schedule {schedule_id}")
+                seat_pk   = seat_row["seat_pk"]
+                seat_code = seat_row["seat_code"]
+                coach     = seat_row["coach_name"]
+
+                # Confirm the seat is not already taken on this date
+                cur.execute(
+                    """
+                    SELECT 1 FROM booking_tickets
+                    WHERE schedule_id = %s
+                      AND travel_date = %s
+                      AND seat_pk = %s
+                      AND status != 'cancelled'
+                    """,
+                    (schedule_id, travel_date, seat_pk),
+                )
+                if cur.fetchone():
+                    return (False, f"Seat {seat_id} is already booked for {travel_date}")
+
+            # ── 5. Generate IDs ──
+            booking_id = _gen_booking_id()
+            payment_id = _gen_payment_id()
+
+            # ── 6. Insert travel_orders ──
+            # FIX BUG-1: all values bound via %s — no inline literals in SQL string
+            cur.execute(
+                """
+                INSERT INTO travel_orders (order_id, user_id, order_type, amount_usd, status)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (booking_id, user_id, "national_rail", round(total_fare, 2), "confirmed"),
+            )
+
+            # ── 7. Insert bookings header ──
+            cur.execute(
+                "INSERT INTO bookings (booking_id) VALUES (%s)",
+                (booking_id,),
+            )
+
+            # ── 8. Insert booking_tickets ──
+            # status bound via %s so it is consistent with step 6 above
+            leg = "single" if ticket_type == "single" else "outbound"
+            cur.execute(
+                """
+                INSERT INTO booking_tickets
+                    (booking_id, schedule_id, origin_station_id, destination_station_id,
+                     seat_pk, travel_date, departure_time, ticket_type, fare_class,
+                     coach, seat_code, stops_travelled, leg, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    booking_id, schedule_id, origin_station_id, destination_station_id,
+                    seat_pk, travel_date, departure_time, ticket_type, fare_class,
+                    coach, seat_code, stops_travelled, leg, "confirmed",
+                ),
+            )
+
+            # ── 9. Insert payment — must be in the same commit as the booking ──
+            cur.execute(
+                """
+                INSERT INTO payments (payment_id, amount_usd, method, status, paid_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                """,
+                (payment_id, round(total_fare, 2), "credit_card", "paid"),
+            )
+            cur.execute(
+                """
+                INSERT INTO payment_sources (payment_id, source_type, national_rail_booking_id)
+                VALUES (%s, %s, %s)
+                """,
+                (payment_id, "national_rail_booking", booking_id),
+            )
+
+        # Single commit covers all inserts — atomicity requirement met
+        conn.commit()
+
+        booking_dict = {
+            "booking_id":              booking_id,
+            "user_id":                 user_id,
+            "schedule_id":             schedule_id,
+            "origin_station_id":       origin_station_id,
+            "destination_station_id":  destination_station_id,
+            "travel_date":             travel_date,
+            "fare_class":              fare_class,
+            "ticket_type":             ticket_type,
+            "seat_code":               seat_code,
+            "coach":                   coach,
+            "stops_travelled":         stops_travelled,
+            # Convert to float only at the final output boundary for JSON serialisation
+            "amount_usd":              float(round(total_fare, 2)),
+            "payment_id":              payment_id,
+        }
+        return (True, booking_dict)
+
+    except Exception as e:
+        conn.rollback()
+        return (False, str(e))
+    finally:
+        conn.close()
 
 
 def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | str]:
     """
     Cancel a national rail booking owned by the given user.
 
-    Calculates the refund amount according to the booking's service type:
-      - Normal service: RF001 windows (100% / 75% / 50% / 0%)
-      - Express service: RF002 windows (100% / 50% / 0%)
+    Refund policy:
+      - Normal service  RF001: ≥48h → 100%, 24–48h → 75% ($0.50 fee),
+                               2–24h → 50% ($0.50 fee), <2h → 0%
+      - Express service RF002: ≥48h → 100%, 24–48h → 50% ($1.00 fee), <24h → 0%
 
     Args:
         booking_id: e.g. "BK001"
@@ -253,9 +465,149 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
         (True, result_dict)  with refund_amount_usd and policy note
         (False, error_msg)
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
 
+            # ── 1. Verify the booking exists, belongs to this user, and is cancellable ──
+            cur.execute(
+                """
+                SELECT to_.order_id, to_.amount_usd, to_.status,
+                    s.service_type
+                FROM travel_orders to_
+                JOIN bookings b ON b.booking_id = to_.order_id
+                JOIN booking_tickets bt ON bt.booking_id = b.booking_id
+                JOIN national_rail_schedules s ON s.schedule_id = bt.schedule_id
+                WHERE to_.order_id = %s
+                AND to_.user_id  = %s
+                AND to_.status   = 'confirmed'
+                AND bt.leg      != 'inbound'
+                LIMIT 1
+                """,
+                (booking_id, user_id),
+            )
+            order = cur.fetchone()
+            if not order:
+                return (False, "Booking not found, already cancelled, or does not belong to this user")
 
+            service_type = order["service_type"]
+            # Keep psycopg2's Decimal return type to preserve NUMERIC(10,2) precision
+            amount_usd = order["amount_usd"]   # Decimal
+
+            # ── 2. Get the earliest uncancelled ticket's departure datetime ──
+            cur.execute(
+                """
+                SELECT bt.travel_date, bt.departure_time
+                FROM booking_tickets bt
+                WHERE bt.booking_id = %s
+                  AND bt.status = 'confirmed'
+                ORDER BY bt.travel_date ASC, bt.departure_time ASC
+                LIMIT 1
+                """,
+                (booking_id,),
+            )
+            ticket = cur.fetchone()
+            if not ticket:
+                return (False, "No active tickets found for this booking")
+
+            # Combine date + time into a timezone-aware datetime for accurate hour calculation
+            departure_dt = datetime.combine(
+                ticket["travel_date"],
+                ticket["departure_time"],
+            ).replace(tzinfo=timezone.utc)
+
+            now = datetime.now(timezone.utc)
+            hours_before = (departure_dt - now).total_seconds() / 3600
+
+            # ── 3. Apply refund policy ──
+            # All percentages and fees built from strings to avoid inheriting
+            # floating-point error (e.g. Decimal(0.75) → Decimal('0.7499...'))
+            #
+            # RF001 (normal):  ≥48h→100%, 24–48h→75% ($0.50 fee), 2–24h→50% ($0.50 fee), <2h→0%
+            # RF002 (express): ≥48h→100%, 24–48h→50% ($1.00 fee), <24h→0%
+            if service_type == "normal":
+                if hours_before >= 48:
+                    refund_pct  = Decimal("1.00")
+                    admin_fee   = Decimal("0.00")
+                    policy_note = "RF001 W1: full refund (≥48 h before departure)"
+                elif hours_before >= 24:
+                    refund_pct  = Decimal("0.75")
+                    admin_fee   = Decimal("0.50")
+                    policy_note = "RF001 W2: 75% refund (24–48 h before departure)"
+                elif hours_before >= 2:
+                    refund_pct  = Decimal("0.50")
+                    admin_fee   = Decimal("0.50")
+                    policy_note = "RF001 W3: 50% refund (2–24 h before departure)"
+                else:
+                    refund_pct  = Decimal("0.00")
+                    admin_fee   = Decimal("0.00")
+                    policy_note = "RF001 W4: no refund (<2 h before departure)"
+            else:
+                # Express service — RF002
+                # FIX BUG-2: W1 (≥48h) is a full refund with no admin fee per RF002 spec
+                if hours_before >= 48:
+                    refund_pct  = Decimal("1.00")
+                    admin_fee   = Decimal("0.00")
+                    policy_note = "RF002 W1: full refund (≥48 h before departure)"
+                elif hours_before >= 24:
+                    refund_pct  = Decimal("0.50")
+                    admin_fee   = Decimal("1.00")
+                    policy_note = "RF002 W2: 50% refund minus $1.00 fee (24–48 h before departure)"
+                else:
+                    refund_pct  = Decimal("0.00")
+                    admin_fee   = Decimal("0.00")
+                    policy_note = "RF002 W3: no refund (<24 h before departure)"
+
+            # Clamp to zero in case fee exceeds the refund amount
+            refund_amount = max(Decimal("0.00"), round(amount_usd * refund_pct - admin_fee, 2))
+
+            # ── 4. Cancel all confirmed tickets in this booking ──
+            cur.execute(
+                """
+                UPDATE booking_tickets
+                SET status       = 'cancelled',
+                    cancelled_at = NOW()
+                WHERE booking_id = %s
+                  AND status     = 'confirmed'
+                """,
+                (booking_id,),
+            )
+
+            # ── 5. Update the parent order status ──
+            cur.execute(
+                "UPDATE travel_orders SET status = 'cancelled' WHERE order_id = %s",
+                (booking_id,),
+            )
+
+            # ── 6. Mark the payment as refunded ──
+            cur.execute(
+                """
+                UPDATE payments p
+                SET status = 'refunded'
+                FROM payment_sources ps
+                WHERE ps.payment_id               = p.payment_id
+                  AND ps.national_rail_booking_id = %s
+                """,
+                (booking_id,),
+            )
+
+        conn.commit()
+
+        return (True, {
+            "booking_id":        booking_id,
+            "status":            "cancelled",
+            # Convert to float only at the final output boundary for JSON serialisation
+            "refund_amount_usd": float(refund_amount),
+            "policy_note":       policy_note,
+        })
+
+    except Exception as e:
+        conn.rollback()
+        return (False, str(e))
+    finally:
+        conn.close()
+        
 # ── AUTHENTICATION QUERIES ────────────────────────────────────────────────────
 
 def register_user(
