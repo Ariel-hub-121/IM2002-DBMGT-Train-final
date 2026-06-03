@@ -212,7 +212,7 @@ def query_cheapest_route(
                 f"""
                 MATCH (origin:Station {{station_id: $origin_id}})
                 MATCH (dest:Station   {{station_id: $dest_id}})
-                MATCH path = (origin)-[:{rel_str}*1..15]->(dest)
+                MATCH path = (origin)-[:{rel_str}*1..30]->(dest)
                 // Reject paths that visit the same node twice (no cycles)
                 WHERE all(n IN nodes(path) WHERE single(x IN nodes(path) WHERE x = n))
                 WITH path,
@@ -305,7 +305,7 @@ def query_alternative_routes(
                 f"""
                 MATCH (origin:Station {{station_id: $origin_id}})
                 MATCH (dest:Station   {{station_id: $dest_id}})
-                MATCH path = (origin)-[:{rel_str}*1..15]->(dest)
+                MATCH path = (origin)-[:{rel_str}*1..30]->(dest)
                 WHERE
                   // Allow origin/dest to equal avoid_id (degenerate input) but block
                   // any intermediate node that matches, since those are the "closed" stops.
