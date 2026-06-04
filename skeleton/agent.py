@@ -47,6 +47,7 @@ from databases.relational.queries import (
     execute_booking,
     execute_cancellation,
     query_policy_vector_search,
+    query_payment_info,
 )
 from databases.graph.queries import (
     query_shortest_route,
@@ -224,6 +225,20 @@ TOOLS = [
         },
         "required": ["booking_id"],
     },
+    # Covers both networks: queries.py does a two-pass lookup (national_rail_booking_id first,
+    # then metro_trip_id) so a single tool handles BK… and MT… IDs without prefix assumptions.
+    {
+        "name": "get_payment_info",
+        "description": (
+            "Look up the payment record for a booking or metro trip purchase. "
+            "Use when the user asks about payment status, payment method, whether they have been charged, "
+            "or asks for payment details for a specific booking ID or trip ID."
+        ),
+        "parameters": {
+            "booking_id": {"type": "string", "description": "Booking ID (e.g. BK001) or metro trip ID (e.g. MT001)"},
+        },
+        "required": ["booking_id"],
+    },
     {
         "name": "search_policy",
         "description": (
@@ -286,7 +301,8 @@ cancel_booking(booking_id)
 get_user_bookings()
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
-get_delay_ripple(station_id, hops?)"""
+get_delay_ripple(station_id, hops?)
+get_payment_info(booking_id)"""
 
 
 # ── Agent logic ───────────────────────────────────────────────────────────────
@@ -380,6 +396,23 @@ def _execute_tool(
                 user_id=profile["user_id"],
             )
             result = data if ok else {"error": data}
+
+        elif tool_name == "get_payment_info":
+            # Normalize param name: LLM sometimes sends 'query' or 'id' instead of 'booking_id'.
+            booking_id = (
+                params.get("booking_id")
+                or params.get("query")
+                or params.get("id")
+                or params.get("booking_reference")
+            )
+            if not booking_id:
+                result = {"error": "Please provide a booking ID."}
+            else:
+                result = query_payment_info(booking_id)
+                # Replace None with an error dict so the LLM receives a readable message,
+                # not a bare JSON null which it cannot meaningfully relay to the user.
+                if result is None:
+                    result = {"error": f"No payment record found for {booking_id}"}
 
         elif tool_name == "search_policy":
             embedding = llm.embed(params["query"])

@@ -1,4 +1,4 @@
-# AI Session Context — TransitFlow
+﻿# AI Session Context — TransitFlow
 
 **How to use this file:**
 At the start of every AI coding session, paste the full contents of this file as your first message to your AI assistant. This gives the AI the context it needs to produce code that fits your codebase and is consistent with your teammates' work.
@@ -29,19 +29,19 @@ TransitFlow is a Python-based AI chat assistant for a fictional transit operator
 - **Empty results:** Return `[]` or `None` (as documented), never raise an exception for "not found"
 - **SQL:** Use `%s` placeholders for all user inputs — never string-format into SQL
 - **Relational pattern:** Use `_connect()` helper + `psycopg2.extras.RealDictCursor`:
-  ```python
+  ``python
   with _connect() as conn:
       with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
           cur.execute("SELECT ...", (param,))
           return [dict(row) for row in cur.fetchall()]
-  ```
+  ``
 - **Graph pattern:** Use `_driver()` helper + session:
-  ```python
+  ``python
   with _driver() as driver:
       with driver.session() as session:
           result = session.run("MATCH ...", station_id=station_id)
           return [dict(record) for record in result]
-  ```
+  ``
 
 ## Agreed Relational Schema
 
@@ -50,7 +50,7 @@ TransitFlow is a Python-based AI chat assistant for a fictional transit operator
   Paste your final CREATE TABLE statements here.
   ============================================================ -->
 
-```sql
+``sql
 -- TODO: paste your final schema.sql contents here after team review
 ----============================================================
 --  TransitFlow PostgreSQL Schema
@@ -1126,7 +1126,7 @@ CREATE TABLE IF NOT EXISTS policy_documents (
 -- Index for fast cosine similarity search
 CREATE INDEX IF NOT EXISTS ON policy_documents USING hnsw (embedding vector_cosine_ops);
 
-```
+``
 
 ## Agreed Graph Schema
 
@@ -1135,7 +1135,7 @@ CREATE INDEX IF NOT EXISTS ON policy_documents USING hnsw (embedding vector_cosi
   relationship types.
   ============================================================ -->
 
-```text
+``text
 Node labels:
 - Metro stations use multiple labels: :Station:Metro:MetroStation
 - National rail stations use multiple labels: :Station:NationalRail:NationalRailStation
@@ -1182,7 +1182,7 @@ Directionality:
 - 所有關係雙向儲存（A→B 與 B→A）
 - METRO_LINK / RAIL_LINK：JSON 鄰接表本身對稱，迴圈自然產生雙向
 - INTERCHANGE_TO：需各自執行兩次 session.run（metro→rail 與 rail→metro）
-```
+``
 
 ## Function Signatures We Are Implementing
 
@@ -1190,7 +1190,7 @@ These are fixed contracts. AI-generated code must match these signatures exactly
 
 ### Relational (`databases/relational/queries.py`)
 
-```python
+``python
 # Read-only
 def query_national_rail_availability(origin_id: str, destination_id: str, travel_date: Optional[str] = None) -> list[dict]: ...
 def query_national_rail_fare(schedule_id: str, fare_class: str, stops_travelled: int) -> Optional[dict]: ...
@@ -1211,18 +1211,18 @@ def login_user(email: str, password: str) -> Optional[dict]: ...
 def get_user_secret_question(email: str) -> Optional[str]: ...
 def verify_secret_answer(email: str, answer: str) -> bool: ...
 def update_password(email: str, new_password: str) -> bool: ...
-```
+``
 
 ### Graph (`databases/graph/queries.py`)
 
-```python
+``python
 def query_shortest_route(origin_id: str, destination_id: str, network: str = "auto") -> dict: ...
 def query_cheapest_route(origin_id: str, destination_id: str, network: str = "auto", fare_class: str = "standard") -> dict: ...
 def query_alternative_routes(origin_id, destination_id, avoid_station_id, network="auto", max_routes=3) -> list[dict]: ...
 def query_interchange_path(origin_id: str, destination_id: str) -> dict: ...
 def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]: ...
 def query_station_connections(station_id: str) -> list[dict]: ...
-```
+``
 
 ## Team Decisions Log
 
@@ -1298,6 +1298,11 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: `query_cheapest_route` 與 `query_alternative_routes` 的路徑深度上限設為 `*1..30`（非 `*1..15`）。Why: 網路含 MS01–MS20（20站）+ NR01–NR10（10站），最長 simple path 達 29 hops；15 會遺漏遠端跨站路徑。
   - Decision: `query_delay_ripple` hops=0 分開處理，hops>0 使用 `*0..N` 包含 source 本身（hops_away=0）。Why: Cypher `*1..N` 無法表達深度 0（只回傳 source）；`*0..N` 讓 source 自然以 hops_away=0 出現在結果中，與 hops=0 case 行為一致。
   - Decision: `query_alternative_routes` 回傳 `list[dict]`，每個 dict 含 `total_time_min`、`path`、`legs`，而非 `list[list[dict]]`。Why: 實作提供完整路由資訊；agent.py 的 `enumerate(routes)` 直接迭代此結構，LLM 能解讀巢狀 dict。
+- [x] `get_payment_info` 工具加入 agent.py (2026-06-04):
+  - Decision: 在 TOOLS 列表新增 `get_payment_info` 工具定義，描述觸發時機為使用者詢問付款狀態、付款方式、是否已扣款、或指定 booking ID / trip ID 的付款明細。同步更新 TOOLS_SCHEMA、`_execute_tool` dispatch，並補上 `query_payment_info` import。Why: 函式雖已在 `queries.py` 實作但未在 agent 中宣告，LLM 沒有任何觸發信號，導致所有付款相關問題無法回答。
+  - Decision: 工具定義前加兩行英文 comment，說明 `queries.py` 採兩段式查詢（先查 `national_rail_booking_id`，查無再查 `metro_trip_id`），一個工具即可處理 BK… 與 MT… 兩種 ID，不依賴前綴假設。Why: 這是非直觀的設計，未來讀者容易誤以為應各網拆成獨立工具。
+  - Decision: `_execute_tool` 中 `query_payment_info` 回傳 `None` 時，替換為 `{"error": "No payment record found for <id>"}` 再序列化，並在該行加上原因 comment。Why: `json.dumps(None)` 產生字串 `"null"`，LLM 無法區分「查無資料」與「欄位缺失」，無法向使用者給出有意義的錯誤訊息。
+  - Decision: `get_payment_info` 分支改為先從 `params` 嘗試四個候選 key（`booking_id` → `query` → `id` → `booking_reference`），取到第一個非空值再呼叫 `query_payment_info(booking_id)`。Why: 實測發現 LLM 有時傳入 `query` 而非 `booking_id`，用 `**params` 展開會導致 `TypeError`；容錯 key 對應覆蓋已知的偏差命名，不依賴 LLM 每次傳對欄位名稱。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
@@ -1305,12 +1310,12 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 <!-- Share prompts that produced good output so teammates can reuse them. -->
 
 ### Schema design prompt that worked:
-```
+``
 TODO — add a prompt here after your schema design workshop
-```
+``
 
 ### Query implementation prompt that worked:
-```
+``
 I'm implementing a Python function for a PostgreSQL database project called TransitFlow.
 Follow these rules strictly:
 
@@ -1340,10 +1345,10 @@ STUB TO IMPLEMENT:
 
 SCHEMA (relevant tables only):
 [paste only the CREATE TABLE statements your function will query — trim the rest]
-```
+``
 
 ### Code Review Prompt:
-```
+``
 Review this Python database function from the TransitFlow project against 
 the stub contract and schema below.
 
@@ -1412,9 +1417,9 @@ IMPLEMENTATION TO REVIEW:
 
 SCHEMA (relevant tables only):
 [paste relevant CREATE TABLE statements]
-```
+``
 ### Debugging Prompt
-```
+``
 I have a bug in a Python database function from the TransitFlow project.
 Help me fix it without changing the function's signature, return type, or logic 
 that is already correct.
@@ -1472,4 +1477,4 @@ OUTPUT FORMAT:
 2. Show only the fixed code (complete function)
 3. Add a one-line comment on the line that was changed explaining what was wrong
 Do NOT rewrite parts that were already correct.
-```
+``
