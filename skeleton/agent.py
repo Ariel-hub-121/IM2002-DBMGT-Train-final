@@ -181,6 +181,18 @@ TOOLS = [
         "parameters": {},
         "required": [],
     },
+    # Added get_user_profile so the LLM can route account/personal-info queries
+    # to the correct tool instead of falling back to get_user_bookings.
+    {
+        "name": "get_user_profile",
+        "description": (
+            "Look up the profile of the currently logged-in user. "
+            "Use when the user asks about their account, personal details, "
+            "name, email, date of birth, or registration info."
+        ),
+        "parameters": {},
+        "required": [],
+    },
     {
         "name": "get_available_seats",
         "description": (
@@ -284,6 +296,7 @@ get_available_seats(schedule_id, travel_date, fare_class)
 make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?)
 cancel_booking(booking_id)
 get_user_bookings()
+get_user_profile()  # added: listed here so the LLM prompt includes it as a selectable tool
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
 get_delay_ripple(station_id, hops?)"""
@@ -347,6 +360,16 @@ def _execute_tool(
             if not current_user_email:
                 return json.dumps({"error": "No user is currently logged in."})
             result = query_user_bookings(current_user_email)
+
+        elif tool_name == "get_user_profile":
+            # Returns account details (name, email, DOB, registration date).
+            # query_user_profile returns None when the email doesn't match any user row.
+            if not current_user_email:
+                result = {"error": "No user is currently logged in."}
+            else:
+                result = query_user_profile(current_user_email)
+                if result is None:
+                    result = {"error": "User profile not found."}
 
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)
