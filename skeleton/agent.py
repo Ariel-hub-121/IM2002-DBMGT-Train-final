@@ -398,11 +398,21 @@ def _execute_tool(
             result = data if ok else {"error": data}
 
         elif tool_name == "get_payment_info":
-            result = query_payment_info(**params)
-            # Replace None with an error dict so the LLM receives a readable message,
-            # not a bare JSON null which it cannot meaningfully relay to the user.
-            if result is None:
-                result = {"error": f"No payment record found for {params.get('booking_id')}"}
+            # Normalize param name: LLM sometimes sends 'query' or 'id' instead of 'booking_id'.
+            booking_id = (
+                params.get("booking_id")
+                or params.get("query")
+                or params.get("id")
+                or params.get("booking_reference")
+            )
+            if not booking_id:
+                result = {"error": "Please provide a booking ID."}
+            else:
+                result = query_payment_info(booking_id)
+                # Replace None with an error dict so the LLM receives a readable message,
+                # not a bare JSON null which it cannot meaningfully relay to the user.
+                if result is None:
+                    result = {"error": f"No payment record found for {booking_id}"}
 
         elif tool_name == "search_policy":
             embedding = llm.embed(params["query"])

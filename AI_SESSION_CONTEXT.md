@@ -1302,6 +1302,7 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: 在 TOOLS 列表新增 `get_payment_info` 工具定義，描述觸發時機為使用者詢問付款狀態、付款方式、是否已扣款、或指定 booking ID / trip ID 的付款明細。同步更新 TOOLS_SCHEMA、`_execute_tool` dispatch，並補上 `query_payment_info` import。Why: 函式雖已在 `queries.py` 實作但未在 agent 中宣告，LLM 沒有任何觸發信號，導致所有付款相關問題無法回答。
   - Decision: 工具定義前加兩行英文 comment，說明 `queries.py` 採兩段式查詢（先查 `national_rail_booking_id`，查無再查 `metro_trip_id`），一個工具即可處理 BK… 與 MT… 兩種 ID，不依賴前綴假設。Why: 這是非直觀的設計，未來讀者容易誤以為應各網拆成獨立工具。
   - Decision: `_execute_tool` 中 `query_payment_info` 回傳 `None` 時，替換為 `{"error": "No payment record found for <id>"}` 再序列化，並在該行加上原因 comment。Why: `json.dumps(None)` 產生字串 `"null"`，LLM 無法區分「查無資料」與「欄位缺失」，無法向使用者給出有意義的錯誤訊息。
+  - Decision: `get_payment_info` 分支改為先從 `params` 嘗試四個候選 key（`booking_id` → `query` → `id` → `booking_reference`），取到第一個非空值再呼叫 `query_payment_info(booking_id)`。Why: 實測發現 LLM 有時傳入 `query` 而非 `booking_id`，用 `**params` 展開會導致 `TypeError`；容錯 key 對應覆蓋已知的偏差命名，不依賴 LLM 每次傳對欄位名稱。
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
