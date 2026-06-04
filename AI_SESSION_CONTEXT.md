@@ -1298,6 +1298,9 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: `query_cheapest_route` 與 `query_alternative_routes` 的路徑深度上限設為 `*1..30`（非 `*1..15`）。Why: 網路含 MS01–MS20（20站）+ NR01–NR10（10站），最長 simple path 達 29 hops；15 會遺漏遠端跨站路徑。
   - Decision: `query_delay_ripple` hops=0 分開處理，hops>0 使用 `*0..N` 包含 source 本身（hops_away=0）。Why: Cypher `*1..N` 無法表達深度 0（只回傳 source）；`*0..N` 讓 source 自然以 hops_away=0 出現在結果中，與 hops=0 case 行為一致。
   - Decision: `query_alternative_routes` 回傳 `list[dict]`，每個 dict 含 `total_time_min`、`path`、`legs`，而非 `list[list[dict]]`。Why: 實作提供完整路由資訊；agent.py 的 `enumerate(routes)` 直接迭代此結構，LLM 能解讀巢狀 dict。
+- [x] `get_user_profile` 工具加入 agent.py (Sharon, 2026-06-04, branch: `feature/sharon/add-user-profile-tool`):
+  - Decision: 在 `skeleton/agent.py` 的三處新增 `get_user_profile` 工具：① TOOLS 列表（加 JSON schema 定義）、② TOOLS_SCHEMA 字串（加 `get_user_profile()` 一行）、③ `_execute_tool()` 加 `elif tool_name == "get_user_profile"` 分支。Why: `query_user_profile` 函數早已在 `databases/relational/queries.py` 實作且已 import，但未在 TOOLS 列表登記，LLM 不知道此工具存在，導致使用者詢問帳號資料時，LLM 誤路由到 `get_user_bookings`。
+  - Decision: `_execute_tool` 的 `get_user_profile` 分支：無登入使用者時回傳 `{"error": "No user is currently logged in."}`；`query_user_profile` 回傳 `None` 時回傳 `{"error": "User profile not found."}`。Why: 防禦性錯誤處理，避免 LLM 收到 `None` 或空值後產生不明確的回答。
 - [x] `get_payment_info` 工具加入 agent.py (2026-06-04):
   - Decision: 在 TOOLS 列表新增 `get_payment_info` 工具定義，描述觸發時機為使用者詢問付款狀態、付款方式、是否已扣款、或指定 booking ID / trip ID 的付款明細。同步更新 TOOLS_SCHEMA、`_execute_tool` dispatch，並補上 `query_payment_info` import。Why: 函式雖已在 `queries.py` 實作但未在 agent 中宣告，LLM 沒有任何觸發信號，導致所有付款相關問題無法回答。
   - Decision: 工具定義前加兩行英文 comment，說明 `queries.py` 採兩段式查詢（先查 `national_rail_booking_id`，查無再查 `metro_trip_id`），一個工具即可處理 BK… 與 MT… 兩種 ID，不依賴前綴假設。Why: 這是非直觀的設計，未來讀者容易誤以為應各網拆成獨立工具。
