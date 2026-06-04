@@ -302,7 +302,11 @@ def _execute_tool(
     """
     try:
         if tool_name == "check_national_rail_availability":
-            result = query_national_rail_availability(**params)
+            result = query_national_rail_availability(
+                origin_id=params["origin_id"],
+                destination_id=params["destination_id"],
+                travel_date=params.get("travel_date"),
+            )
 
         elif tool_name == "get_national_rail_fare":
             result = query_national_rail_fare(**params)
