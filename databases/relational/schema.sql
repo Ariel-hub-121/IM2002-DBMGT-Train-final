@@ -7,24 +7,32 @@
 --    2. Vector      → policy documents for RAG (provided — do not modify)
 -- ============================================================
 
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 -- ============================================================
 -- PRIMARY KEY DESIGN
 --
--- Two PK types are used throughout this schema:
+-- Three PK types are used throughout this schema:
 --
--- VARCHAR(10–50): for IDs that carry business meaning.
---   These IDs (e.g. user_id='U001', schedule_id='NR1_SCH_01') originate from
---   mock data or external systems and are human-readable by design.
---   UUID is not used because this system does not require distributed uniqueness
---   and UUID adds storage overhead with no benefit at this scale.
---   SERIAL is not used for these columns because a purely numeric surrogate key
---   would lose the semantic meaning the business ID already provides.
+-- SERIAL (INT): for internal lookup tables whose IDs are never exposed to users.
+--   Applied to station, schedule, seat-layout, and feedback tables. Surrogate
+--   integer PKs eliminate the need to manage human-readable business IDs in these
+--   tables, and INT FK joins outperform VARCHAR joins at scale.
+--   SERIAL is preferred over BIGSERIAL where cumulative row counts will not
+--   approach the INT upper bound (~2.1 billion).
 --
--- BIGSERIAL / SERIAL: for internal records that have no natural business key
---   and require a DB-generated surrogate (e.g. seat_pk, coach_id, stop id).
---   These are referenced heavily as FKs; integer joins outperform VARCHAR joins.
---   BIGSERIAL is preferred over SERIAL where cumulative row counts could exceed
---   the INT upper bound (~2.1 billion) over the system's operational lifetime.
+-- UUID DEFAULT gen_random_uuid(): for user-facing records whose IDs appear in
+--   API responses, booking confirmations, and URLs.
+--   Applied to: users, travel_orders, bookings, metro_trip_purchases,
+--   metro_day_pass_trips, payments.
+--   UUID prevents sequential enumeration (no "order 1001 → try 1002") and is safe
+--   to expose externally without leaking record-count information.
+--   gen_random_uuid() requires the pgcrypto extension (added above).
+--
+-- BIGSERIAL: for internal records with potentially very large cumulative row counts.
+--   Used where rows could approach the INT upper bound over the system's operational
+--   lifetime (national_rail_coaches, national_rail_seats). BIGSERIAL FKs are
+--   referenced as BIGINT; integer joins outperform VARCHAR joins at scale.
 -- ============================================================
 
 -- ============================================================
@@ -66,8 +74,8 @@
 -- ============================================================
 
 CREATE TABLE "users" (
-  -- VARCHAR(20) business ID (e.g. 'U001') aligned with mock data; human-readable.
-  "user_id"       VARCHAR(20)  PRIMARY KEY,
+  -- UUID PK: user-facing ID; UUID prevents sequential enumeration of user accounts.
+  "user_id"       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
   "full_name"     VARCHAR(100) NOT NULL,
   "email"         VARCHAR(100) NOT NULL UNIQUE,
   "phone"         VARCHAR(50),
@@ -81,10 +89,10 @@ CREATE TABLE "users" (
 COMMENT ON TABLE "users" IS 'Registered passenger accounts. Delete strategy: soft delete via is_active=FALSE to preserve historical order and payment references.';
 
 CREATE TABLE "user_security" (
-  -- VARCHAR(20) shares the same type as users.user_id; serves as both PK and FK.
+  -- UUID PK: shares the same type as users.user_id; serves as both PK and FK.
   -- Security-sensitive columns are isolated from the users table so that
   -- general queries (e.g. profile lookups) never expose password hashes.
-  "user_id"            VARCHAR(20)  PRIMARY KEY,
+  "user_id"            UUID         PRIMARY KEY,
   -- Password stored as an Argon2id hash.
   -- Argon2id encodes the salt, parameters, and digest in a single self-contained
   -- string (PHC format), so no separate salt column is needed.
@@ -103,15 +111,15 @@ COMMENT ON TABLE "user_security" IS 'User authentication data, separated from th
 -- ============================================================
 
 CREATE TABLE "metro_stations" (
-  -- VARCHAR(10) business ID (e.g. 'MS01') aligned with mock data.
-  "station_id" VARCHAR(10)  PRIMARY KEY,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "station_id" SERIAL       PRIMARY KEY,
   "name"       VARCHAR(100) NOT NULL
 );
 
 COMMENT ON TABLE "metro_stations" IS 'Metro station master data.';
 
 CREATE TABLE "metro_station_lines" (
-  "station_id" VARCHAR(10) NOT NULL,
+  "station_id" INT         NOT NULL,
   "line_name"  VARCHAR(20) NOT NULL,
   -- Composite PK: (station_id, line_name) is a natural unique key; no surrogate needed.
   -- A station belonging to multiple lines implicitly means it is an intra-metro interchange;
@@ -139,7 +147,7 @@ COMMENT ON TABLE "metro_station_lines" IS 'Metro lines serving each station (one
 -- ============================================================
 
 CREATE TABLE "metro_line_transfer_times" (
-  "station_id"        VARCHAR(10) NOT NULL,
+  "station_id"        INT         NOT NULL,
   "from_line"         VARCHAR(20) NOT NULL,
   "to_line"           VARCHAR(20) NOT NULL,
   -- Walking time between platforms at this station, in minutes.
@@ -162,15 +170,15 @@ COMMENT ON COLUMN "metro_line_transfer_times"."transfer_time_min" IS 'Platform-t
 -- ============================================================
 
 CREATE TABLE "national_rail_stations" (
-  -- VARCHAR(10) business ID (e.g. 'NR01'), symmetric with metro_stations design.
-  "station_id" VARCHAR(10)  PRIMARY KEY,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "station_id" SERIAL       PRIMARY KEY,
   "name"       VARCHAR(100) NOT NULL
 );
 
 COMMENT ON TABLE "national_rail_stations" IS 'National rail station master data.';
 
 CREATE TABLE "national_rail_station_lines" (
-  "station_id" VARCHAR(10) NOT NULL,
+  "station_id" INT         NOT NULL,
   "line_name"  VARCHAR(20) NOT NULL,
   -- Composite PK: natural unique key, same rationale as metro_station_lines.
   PRIMARY KEY ("station_id", "line_name")
@@ -199,10 +207,10 @@ COMMENT ON TABLE "national_rail_station_lines" IS 'National rail lines serving e
 -- ============================================================
 
 CREATE TABLE "metro_rail_interchanges" (
-  "metro_station_id"  VARCHAR(10) NOT NULL,
-  "rail_station_id"   VARCHAR(10) NOT NULL,
+  "metro_station_id"  INT NOT NULL,
+  "rail_station_id"   INT NOT NULL,
   -- Walking time between the metro and rail platforms, in minutes.
-  "transfer_time_min" INT         NOT NULL DEFAULT 5
+  "transfer_time_min" INT NOT NULL DEFAULT 5
     CHECK ("transfer_time_min" >= 0),
   PRIMARY KEY ("metro_station_id", "rail_station_id")
 );
@@ -216,12 +224,12 @@ COMMENT ON COLUMN "metro_rail_interchanges"."transfer_time_min" IS 'Walking time
 -- ============================================================
 
 CREATE TABLE "metro_schedules" (
-  -- VARCHAR(50) business ID aligned with mock data schedule identifiers.
-  "schedule_id"       VARCHAR(50)   PRIMARY KEY,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "schedule_id"       SERIAL        PRIMARY KEY,
   "line_name"         VARCHAR(20)   NOT NULL,
   "direction"         VARCHAR(50)   NOT NULL,
-  "origin_station_id" VARCHAR(10),
-  "dest_station_id"   VARCHAR(10),
+  "origin_station_id" INT,
+  "dest_station_id"   INT,
   "first_train_time"  TIME          NOT NULL,
   "last_train_time"   TIME          NOT NULL,
   -- NUMERIC(10,2) stores fares to the cent, avoiding floating-point rounding errors.
@@ -234,10 +242,10 @@ CREATE TABLE "metro_schedules" (
 COMMENT ON TABLE "metro_schedules" IS 'Metro schedule definitions including fare parameters. Fare formula: total_fare = base_fare + per_stop_rate × stops_travelled.';
 
 CREATE TABLE "metro_schedule_stops" (
-  "schedule_id"                 VARCHAR(50) NOT NULL,
-  "station_id"                  VARCHAR(10) NOT NULL,
-  "stop_sequence"               INT         NOT NULL CHECK ("stop_sequence" > 0),
-  "travel_time_from_origin_min" INT         NOT NULL CHECK ("travel_time_from_origin_min" >= 0),
+  "schedule_id"                 INT NOT NULL,
+  "station_id"                  INT NOT NULL,
+  "stop_sequence"               INT NOT NULL CHECK ("stop_sequence" > 0),
+  "travel_time_from_origin_min" INT NOT NULL CHECK ("travel_time_from_origin_min" >= 0),
   -- Composite PK: a schedule visits each station at most once.
   PRIMARY KEY ("schedule_id", "station_id"),
   -- stop_sequence must be unique within a schedule to give an unambiguous stop order.
@@ -247,8 +255,8 @@ CREATE TABLE "metro_schedule_stops" (
 COMMENT ON TABLE "metro_schedule_stops" IS 'Ordered stop list for each metro schedule. Stops are stored as individual rows (not an array column) with an explicit stop_sequence, as required by the schema normalisation rules.';
 
 CREATE TABLE "metro_schedule_operating_days" (
-  "schedule_id" VARCHAR(50) NOT NULL,
-  "day_of_week" VARCHAR(3)  NOT NULL,
+  "schedule_id" INT        NOT NULL,
+  "day_of_week" VARCHAR(3) NOT NULL,
   PRIMARY KEY ("schedule_id", "day_of_week"),
   CHECK ("day_of_week" IN ('mon','tue','wed','thu','fri','sat','sun'))
 );
@@ -261,16 +269,16 @@ COMMENT ON TABLE "metro_schedule_operating_days" IS 'Operating days for each met
 -- ============================================================
 
 CREATE TABLE "national_rail_schedules" (
-  -- VARCHAR(20) business ID (e.g. 'NR1_SCH_01') aligned with mock data.
-  "schedule_id"            VARCHAR(20) PRIMARY KEY,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "schedule_id"            SERIAL      PRIMARY KEY,
   "line_name"              VARCHAR(20) NOT NULL,
   -- service_type drives the refund policy applied at cancellation time:
   --   normal  → RF001 (standard refund window)
   --   express → RF002 (stricter refund window)
   "service_type"           VARCHAR(20) NOT NULL CHECK ("service_type" IN ('normal','express')),
   "direction"              VARCHAR(50) NOT NULL,
-  "origin_station_id"      VARCHAR(10),
-  "destination_station_id" VARCHAR(10),
+  "origin_station_id"      INT,
+  "destination_station_id" INT,
   "first_train_time"       TIME        NOT NULL,
   "last_train_time"        TIME        NOT NULL,
   "frequency_min"          INT         NOT NULL CHECK ("frequency_min" > 0),
@@ -284,19 +292,19 @@ CREATE TABLE "national_rail_schedule_stops" (
   -- The same station may appear in multiple historical versions of a schedule
   -- (see effective_from / effective_to); business uniqueness is enforced by
   -- the UNIQUE indexes below, not by the PK itself.
-  "id"                          SERIAL      PRIMARY KEY,
-  "schedule_id"                 VARCHAR(20),
-  "station_id"                  VARCHAR(10),
-  "stop_order"                  INT         NOT NULL,
-  "travel_time_from_origin_min" INT         NOT NULL,
+  "id"                          SERIAL  PRIMARY KEY,
+  "schedule_id"                 INT,
+  "station_id"                  INT,
+  "stop_order"                  INT     NOT NULL,
+  "travel_time_from_origin_min" INT     NOT NULL,
   -- is_stop distinguishes a scheduled stop from a pass-through (express trains
   -- may pass a station without stopping but still need it in the sequence for
   -- travel-time calculations).
-  "is_stop"                     BOOLEAN     NOT NULL DEFAULT TRUE,
+  "is_stop"                     BOOLEAN NOT NULL DEFAULT TRUE,
   -- effective_from / effective_to support temporal changes to stop status,
   -- e.g. a station temporarily removed from service for platform works.
   -- effective_to = NULL means this record is currently active.
-  "effective_from"              DATE        NOT NULL DEFAULT '2000-01-01',
+  "effective_from"              DATE    NOT NULL DEFAULT '2000-01-01',
   "effective_to"                DATE,
 
   -- Reject intervals where the end date precedes the start date.
@@ -310,8 +318,8 @@ COMMENT ON COLUMN "national_rail_schedule_stops"."effective_from" IS 'Start date
 COMMENT ON COLUMN "national_rail_schedule_stops"."effective_to"   IS 'End date (exclusive) for this stop status version. NULL means currently active.';
 
 CREATE TABLE "national_rail_schedule_operating_days" (
-  "schedule_id" VARCHAR(20) NOT NULL,
-  "day_of_week" VARCHAR(3)  NOT NULL,
+  "schedule_id" INT        NOT NULL,
+  "day_of_week" VARCHAR(3) NOT NULL,
   PRIMARY KEY ("schedule_id", "day_of_week"),
   CHECK ("day_of_week" IN ('mon','tue','wed','thu','fri','sat','sun'))
 );
@@ -319,7 +327,7 @@ CREATE TABLE "national_rail_schedule_operating_days" (
 COMMENT ON TABLE "national_rail_schedule_operating_days" IS 'Operating days for each national rail schedule.';
 
 CREATE TABLE "national_rail_schedule_fares" (
-  "schedule_id"       VARCHAR(20)   NOT NULL,
+  "schedule_id"       INT           NOT NULL,
   "fare_class"        VARCHAR(20)   NOT NULL CHECK ("fare_class" IN ('standard','first')),
   -- NUMERIC(10,2) stores fares to the cent, avoiding floating-point rounding errors.
   "base_fare_usd"     NUMERIC(10,2) NOT NULL CHECK ("base_fare_usd"     >= 0),
@@ -336,10 +344,10 @@ COMMENT ON TABLE "national_rail_schedule_fares" IS 'Per-class fare parameters fo
 -- ============================================================
 
 CREATE TABLE "national_rail_seat_layouts" (
-  -- VARCHAR(20) business ID aligned with mock data layout identifiers.
-  "layout_id"   VARCHAR(20) PRIMARY KEY,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "layout_id"   SERIAL PRIMARY KEY,
   -- Each schedule has exactly one seat layout (enforced by UNIQUE).
-  "schedule_id" VARCHAR(20) NOT NULL UNIQUE
+  "schedule_id" INT    NOT NULL UNIQUE
 );
 
 COMMENT ON TABLE "national_rail_seat_layouts" IS 'Seat layout definition for each national rail schedule (1:1 relationship).';
@@ -348,7 +356,7 @@ CREATE TABLE "national_rail_coaches" (
   -- BIGSERIAL surrogate PK: coach_name is only unique within a layout,
   -- not globally. A surrogate integer is needed for the FK from national_rail_seats.
   "coach_id"   BIGSERIAL   PRIMARY KEY,
-  "layout_id"  VARCHAR(20) NOT NULL,
+  "layout_id"  INT         NOT NULL,
   "coach_name" VARCHAR(10) NOT NULL,
   -- fare_class determines the ticket class required to occupy seats in this coach.
   "fare_class" VARCHAR(20) NOT NULL CHECK ("fare_class" IN ('standard','first')),
@@ -379,9 +387,9 @@ COMMENT ON TABLE "national_rail_seats" IS 'Individual seat definitions. seat_pk 
 -- ============================================================
 
 CREATE TABLE "travel_orders" (
-  -- VARCHAR(20) business ID aligned with mock data order identifiers.
-  "order_id"   VARCHAR(20)   PRIMARY KEY,
-  "user_id"    VARCHAR(20)   NOT NULL,
+  -- UUID PK: user-facing ID; UUID prevents sequential enumeration of orders.
+  "order_id"   UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  "user_id"    UUID          NOT NULL,
   -- order_type is a discriminator that determines which child table holds the
   -- order details: national_rail → bookings, metro → metro_trip_purchases.
   "order_type" VARCHAR(20)   NOT NULL CHECK ("order_type" IN ('national_rail','metro')),
@@ -399,11 +407,11 @@ COMMENT ON TABLE "travel_orders" IS 'Shared parent table for all orders. order_t
 -- ============================================================
 
 CREATE TABLE "bookings" (
-  -- VARCHAR(20) shares the same type as travel_orders.order_id; acts as both PK and FK.
-  "booking_id"         VARCHAR(20) PRIMARY KEY,
+  -- UUID PK: user-facing ID; shares the same type as travel_orders.order_id; acts as both PK and FK.
+  "booking_id"         UUID PRIMARY KEY,
   -- ticket_count is a denormalised cache maintained by the trg_sync_ticket_count trigger.
   -- It avoids a COUNT(*) query on booking_tickets every time the booking is displayed.
-  "ticket_count"       INT         NOT NULL DEFAULT 0,
+  "ticket_count"       INT  NOT NULL DEFAULT 0,
   -- return_travel_date is a denormalised cache maintained by trg_sync_return_travel_date.
   -- It allows return-trip bookings to be filtered by return date without joining
   -- booking_tickets every time.
@@ -419,10 +427,10 @@ CREATE TABLE "booking_tickets" (
   -- SERIAL (not BIGSERIAL) is sufficient; total ticket volume in a single system
   -- is not expected to exceed the INT upper bound (~2.1 billion).
   "ticket_id"              SERIAL      PRIMARY KEY,
-  "booking_id"             VARCHAR(20),
-  "schedule_id"            VARCHAR(20),
-  "origin_station_id"      VARCHAR(10),
-  "destination_station_id" VARCHAR(10),
+  "booking_id"             UUID,
+  "schedule_id"            INT,
+  "origin_station_id"      INT,
+  "destination_station_id" INT,
   -- seat_pk is nullable: if the seat is retired (rolling stock change), the FK is
   -- set to NULL (ON DELETE SET NULL) to preserve the ticket history.
   "seat_pk"                BIGINT,
@@ -623,11 +631,11 @@ COMMENT ON FUNCTION sync_return_travel_date() IS
 -- ============================================================
 
 CREATE TABLE "metro_trip_purchases" (
-  -- VARCHAR(20) shares the same type as travel_orders.order_id; acts as both PK and FK.
-  "purchase_id"            VARCHAR(20) PRIMARY KEY,
-  "schedule_id"            VARCHAR(50) NOT NULL,
-  "origin_station_id"      VARCHAR(10) NOT NULL,
-  "destination_station_id" VARCHAR(10) NOT NULL,
+  -- UUID PK: user-facing ID; shares the same type as travel_orders.order_id; acts as both PK and FK.
+  "purchase_id"            UUID        PRIMARY KEY,
+  "schedule_id"            INT         NOT NULL,
+  "origin_station_id"      INT         NOT NULL,
+  "destination_station_id" INT         NOT NULL,
   "travel_date"            DATE        NOT NULL,
   "ticket_type"            VARCHAR(20) NOT NULL CHECK ("ticket_type" IN ('single','day_pass')),
   -- stops_travelled is required for single tickets (used in fare calculation).
@@ -658,12 +666,12 @@ COMMENT ON COLUMN "metro_trip_purchases"."stops_travelled" IS 'Required for sing
 COMMENT ON COLUMN "metro_trip_purchases"."cancelled_at"    IS 'Cancellation timestamp. Mutually exclusive with travelled_at (chk_metro_cancelled_at): a completed journey cannot be cancelled.';
 
 CREATE TABLE "metro_day_pass_trips" (
-  -- VARCHAR(20) business ID for each individual day-pass journey event.
-  "trip_id"                VARCHAR(20) PRIMARY KEY,
-  "purchase_id"            VARCHAR(20) NOT NULL,
-  "schedule_id"            VARCHAR(50) NOT NULL,
-  "origin_station_id"      VARCHAR(10) NOT NULL,
-  "destination_station_id" VARCHAR(10) NOT NULL,
+  -- UUID PK: user-facing ID; UUID prevents sequential enumeration of trip records.
+  "trip_id"                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  "purchase_id"            UUID        NOT NULL,
+  "schedule_id"            INT         NOT NULL,
+  "origin_station_id"      INT         NOT NULL,
+  "destination_station_id" INT         NOT NULL,
   "stops_travelled"        INT         NOT NULL CHECK ("stops_travelled" >= 0),
   "travelled_at"           TIMESTAMPTZ NOT NULL,
 
@@ -688,8 +696,8 @@ COMMENT ON COLUMN "metro_day_pass_trips"."purchase_id" IS 'FK to metro_trip_purc
 -- ============================================================
 
 CREATE TABLE "payments" (
-  -- VARCHAR(20) business ID aligned with mock data payment identifiers.
-  "payment_id" VARCHAR(20)   PRIMARY KEY,
+  -- UUID PK: user-facing ID; UUID prevents sequential enumeration of payment records.
+  "payment_id" UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
   "amount_usd" NUMERIC(10,2) NOT NULL CHECK ("amount_usd" >= 0),
   "method"     VARCHAR(20)   NOT NULL CHECK ("method" IN ('credit_card','debit_card','ewallet')),
   "status"     VARCHAR(20)   NOT NULL CHECK ("status" IN ('pending','paid','refunded','failed')),
@@ -699,11 +707,11 @@ CREATE TABLE "payments" (
 COMMENT ON TABLE "payments" IS 'Payment records, independent of their order source. Source routing is delegated to payment_sources, making it easy to add new payment source types.';
 
 CREATE TABLE "payment_sources" (
-  -- VARCHAR(20) shares the same type as payments.payment_id; no separate surrogate needed.
-  "payment_id"               VARCHAR(20) PRIMARY KEY,
+  -- UUID PK: shares the same type as payments.payment_id; serves as both PK and FK.
+  "payment_id"               UUID        PRIMARY KEY,
   "source_type"              VARCHAR(30) NOT NULL,
-  "national_rail_booking_id" VARCHAR(20),
-  "metro_trip_id"            VARCHAR(20),
+  "national_rail_booking_id" UUID,
+  "metro_trip_id"            UUID,
 
   -- Enforce two invariants simultaneously:
   --   1. Exactly one source column is non-NULL (no payment covers two orders).
@@ -733,9 +741,9 @@ COMMENT ON COLUMN "payment_sources"."source_type" IS 'Discriminator identifying 
 -- ============================================================
 
 CREATE TABLE "customer_feedback" (
-  -- VARCHAR(20) business ID aligned with mock data.
-  "feedback_id"  VARCHAR(20) PRIMARY KEY,
-  "order_id"     VARCHAR(20) NOT NULL,
+  -- SERIAL surrogate PK: internal lookup table; not exposed to users.
+  "feedback_id"  SERIAL      PRIMARY KEY,
+  "order_id"     UUID        NOT NULL,
   "rating"       INT         NOT NULL CHECK ("rating" BETWEEN 1 AND 5),
   "submitted_at" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   -- One feedback entry per order prevents duplicate submissions.
@@ -746,8 +754,9 @@ COMMENT ON TABLE  "customer_feedback"            IS 'Passenger ratings, one per 
 COMMENT ON COLUMN "customer_feedback"."order_id" IS 'FK to travel_orders.order_id. To identify the reviewer, JOIN travel_orders on this column and read user_id from there.';
 
 CREATE TABLE "feedback_comments" (
-  "feedback_id"  VARCHAR(20) PRIMARY KEY,
-  "comment_text" TEXT        NOT NULL
+  -- INT PK: shares the same type as customer_feedback.feedback_id; serves as both PK and FK.
+  "feedback_id"  INT  PRIMARY KEY,
+  "comment_text" TEXT NOT NULL
 );
 
 COMMENT ON TABLE "feedback_comments" IS 'Optional free-text comments attached to a rating. Stored in a separate 1:1 table to keep the TEXT column out of customer_feedback and avoid penalising rating-only queries.';
