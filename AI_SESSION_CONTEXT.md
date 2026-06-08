@@ -1305,6 +1305,13 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: `seat_pk_map` 的 key 由原本的 `(VARCHAR schedule_id, coach_name, seat_code)` 改為 `(INT schedule_id, coach_name, seat_code)`。Why: 三表 JOIN 查回的 `sl.schedule_id` 已是 DB INT；`booking_tickets` seeder 以 `rail_schedule_map[b["schedule_id"]]` 轉換後 lookup，型別一致。
   - Decision: `seed_metro_travels` 中的 stop 一致性驗證，改為先將 JSON stop set 中的 string key 通過 `metro_schedule_map` / `metro_station_map` 轉為 INT，再與 DB `metro_schedule_stops` 中的 INT 欄位比對。Why: 遷移後 DB 儲存 INT，直接比對 string set 會永遠不一致。
 
+- [x] `json_id` 欄位補充：保留 schedule JSON 業務字串（schema + seeder，2026-06-08）：
+  **問題根源**
+  - Decision: 在 `metro_schedules` 與 `national_rail_schedules` 各加入 `"json_id" VARCHAR(50) UNIQUE`（可 NULL，緊接在 SERIAL PK 之後）。Why: SERIAL 遷移後 DB 只剩自動產生的整數 PK，原始 JSON 的業務字串（如 `"MS_SCH01"`、`"NR_SCH01"`）已無欄位保存。Agent 收到使用者查詢後傳入 schedule 字串，若 DB 中找不到此字串則無法查詢；`json_id` 作為「業務 ID 保留欄」解決此斷鏈問題。
+  - Decision: `seed_metro_schedules` 與 `seed_national_rail_schedules` 的 INSERT 欄位列表加入 `json_id`，值為 `s["schedule_id"]`（即 JSON 原始字串）。Why: 欄位加入 schema 後，seeder 必須同步填值，否則 `json_id` 永遠為 NULL，等同沒有加。
+  - Decision: `json_id` 宣告為 `UNIQUE` 而非 `NOT NULL`。Why: `UNIQUE` 防止同一業務 ID 被重複插入（idempotency 保護）；`NULL` 允許保留未來手動或程式建立的記錄不強制帶業務 ID。
+  - ⚠️ **查詢層注意**：`queries.py` 中凡接收 `schedule_id` 字串參數的函式，應改用 `WHERE json_id = %s` 取代原本的 `WHERE schedule_id = %s`，才能從 Agent 傳入的 `"MS_SCH01"` 對應到正確的 SERIAL 整數 PK。
+
 - [x] query_national_rail_availability — available_seats 計算方式 (2026-06-02):
   - Decision: `available_seats = total_seats - MAX(同一 departure_time 的訂座數)`，而非 `total_seats - 當天所有班次訂座加總`。 Why: 同一物理座位在不同 departure_time 可各自被訂（uq_booking_tickets_seat 的 unique key 包含 departure_time），若直接加總全天訂座量會超過 total_seats 產生負數。以最繁忙班次的訂座量為基準，得到的是保守但永遠非負的可用座位估計。
   - Decision: stops_travelled 計算：national rail 用 COUNT(is_stop=TRUE) 實際站數（不是 stop_order 差值）；metro 用 dest_stop_sequence - origin_stop_sequence。 Why: 快車在某些站是 pass-through（is_stop=FALSE），若用 stop_order 差值會把通過站也計費；metro 無 pass-through 概念故可直接用序列差。
