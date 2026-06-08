@@ -744,7 +744,7 @@ def query_user_bookings(user_email: str) -> dict:
                     b.ticket_count,
                     b.return_travel_date,
                     bt.ticket_id,
-                    bt.schedule_id,
+                    nrs.json_id             AS schedule_id,
                     bt.origin_station_id,
                     nrs_o.name              AS origin_name,
                     bt.destination_station_id,
@@ -765,6 +765,8 @@ def query_user_bookings(user_email: str) -> dict:
                   ON b.booking_id  = tord.order_id
                 JOIN booking_tickets bt
                   ON bt.booking_id = b.booking_id
+                LEFT JOIN national_rail_schedules nrs
+                  ON nrs.schedule_id = bt.schedule_id
                 LEFT JOIN national_rail_stations nrs_o
                   ON nrs_o.station_id = bt.origin_station_id
                 LEFT JOIN national_rail_stations nrs_d
@@ -784,7 +786,7 @@ def query_user_bookings(user_email: str) -> dict:
                     tord.status             AS order_status,
                     tord.amount_usd,
                     tord.created_at,
-                    mtp.schedule_id,
+                    ms.json_id              AS schedule_id,
                     mtp.origin_station_id,
                     ms_o.name               AS origin_name,
                     mtp.destination_station_id,
@@ -798,6 +800,8 @@ def query_user_bookings(user_email: str) -> dict:
                 FROM travel_orders tord
                 JOIN metro_trip_purchases mtp
                   ON mtp.purchase_id = tord.order_id
+                LEFT JOIN metro_schedules ms
+                  ON ms.schedule_id = mtp.schedule_id
                 LEFT JOIN metro_stations ms_o
                   ON ms_o.station_id = mtp.origin_station_id
                 LEFT JOIN metro_stations ms_d
