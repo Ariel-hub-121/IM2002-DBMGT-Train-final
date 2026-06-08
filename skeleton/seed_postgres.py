@@ -207,11 +207,12 @@ def seed_metro_schedules(cur, metro_station_map):
         execute_values(
             cur,
             "INSERT INTO metro_schedules"
-            " (line_name, direction, origin_station_id, dest_station_id,"
+            " (json_id, line_name, direction, origin_station_id, dest_station_id,"
             "  first_train_time, last_train_time, base_fare_usd, per_stop_rate_usd, frequency_min)"
             " VALUES %s",
             [
                 (
+                    s["schedule_id"],
                     s["line"],
                     s["direction"],
                     metro_station_map[s["origin_station_id"]],
@@ -288,11 +289,12 @@ def seed_national_rail_schedules(cur, rail_station_map):
         execute_values(
             cur,
             "INSERT INTO national_rail_schedules"
-            " (line_name, service_type, direction, origin_station_id, destination_station_id,"
+            " (json_id, line_name, service_type, direction, origin_station_id, destination_station_id,"
             "  first_train_time, last_train_time, frequency_min)"
             " VALUES %s",
             [
                 (
+                    s["schedule_id"],
                     s["line"],
                     s["service_type"],
                     s["direction"],
