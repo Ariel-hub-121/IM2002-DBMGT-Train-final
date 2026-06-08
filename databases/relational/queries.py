@@ -1303,7 +1303,8 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             "booking_id":        booking_uuid,
             "status":            "cancelled",
             # Convert to float only at the final output boundary for JSON serialisation
-            "refund_amount_usd": float(refund_amount),
+            "refund_amount":     float(refund_amount),
+            "refund_amount_usd": float(refund_amount),  # alias kept for display compatibility
             "policy_note":       policy_note,
         })
 
