@@ -1229,11 +1229,19 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
 - [x] Schema design (已完成，詳見 databases/relational/schema.sql):
-  - Decision: PK 採用 VARCHAR business ID（如 "U001", "NR01"）給有業務意義的欄位，BIGSERIAL/SERIAL 給無自然 key 的內部記錄（如 seat_pk, coach_id, ticket_id）。 Why: VARCHAR ID 保留可讀性；BIGSERIAL 整數 FK join 效能優於 VARCHAR；不用 UUID 因為不需要分散式唯一性。
+  - ~~Decision: PK 採用 VARCHAR business ID（如 "U001", "NR01"）給有業務意義的欄位，BIGSERIAL/SERIAL 給無自然 key 的內部記錄（如 seat_pk, coach_id, ticket_id）。~~ **⚠️ 已被下方 2026-06-08 的 PK 遷移決策取代。**
   - Decision: 刪除策略採混合模式。users 用 soft delete（is_active=FALSE），保留歷史訂單審計軌跡；訂單子層資料（booking_tickets 等）用 ON DELETE CASCADE；booking_tickets.seat_pk 用 ON DELETE SET NULL（座位退役時保留票務記錄）；travel_orders.user_id 用 ON DELETE RESTRICT（強制先 soft delete）。 Why: 財務記錄不能因帳號刪除而消失；每個 FK 都明確宣告行為，不依賴資料庫預設值。
   - Decision: national_rail_schedule_stops 有 is_stop 欄位區分「實際停靠」與「通過不停」（快車）。 Why: 票價計算以 is_stop=TRUE 的站數為準，快車通過中間站不計費。
   - Decision: 密碼使用 Argon2id（PHC format），存在獨立的 user_security 表。 Why: PHC format 將 salt 嵌入 hash 字串，不需要獨立 salt 欄位；user_security 獨立避免一般查詢意外曝露 hash。
   - Decision: booking_tickets 有部分唯一索引 uq_booking_tickets_seat on (schedule_id, travel_date, departure_time, seat_pk) WHERE seat_pk IS NOT NULL AND status != 'cancelled'。 Why: 同一物理座位在同一班次同一時刻只能被一個有效訂票佔用；cancelled 排除讓座位可重新被訂。
+- [x] Schema PK 策略遷移（feature/schema_PK，2026-06-08）：
+  - Decision: 採用三層 PK 策略，取代原本全面使用 VARCHAR business ID 的設計。
+    - `SERIAL`（INT）：用於**使用者看不到的內部 lookup 表**（站點、時刻表、座位配置、客服回饋）。Why: INT FK join 效能優於 VARCHAR；DB 自動產生，不需管理業務 ID；整數索引較小。
+    - `UUID DEFAULT gen_random_uuid()`：用於**使用者可見的 ID**（users、travel_orders、bookings、metro_trip_purchases、metro_day_pass_trips、payments）。Why: 防止連號枚舉（order 1001 → 猜 1002）；UUID 安全暴露於 API response 與 URL；需在 schema 頂端加 `CREATE EXTENSION IF NOT EXISTS "pgcrypto"`。
+    - `BIGSERIAL`（不動）：`national_rail_coaches.coach_id`、`national_rail_seats.seat_pk`、`booking_tickets.ticket_id`、`national_rail_schedule_stops.id`，原設計已正確，維持不變。
+  - Decision: 所有引用已遷移 PK 的 FK 欄位，型別一律跟隨父表 PK 更新（station_id → INT、schedule_id → INT、layout_id → INT、feedback_id → INT；user_id → UUID、order_id → UUID、booking_id → UUID、purchase_id → UUID、payment_id → UUID）。Why: FK 型別必須與 PK 完全一致，PostgreSQL 不允許跨型別 FK。
+  - ⚠️ **隊友注意**：此 PR 合併後必須執行 `docker compose down -v && docker compose up -d` 並重跑三支 seed 腳本，否則本地 DB 與新 schema 型別不相容。
+
 - [x] Graph schema (已在 seed_neo4j.py 實作，2026-05-30):
   - Decision: Node labels 採用三重標籤（`:Station:Metro:MetroStation` / `:Station:NationalRail:NationalRailStation`）。 Why: 第三個標籤（:MetroStation / :NationalRailStation）對應教師評分規範的名稱；前兩個標籤保留全網與單網查詢彈性。
   - Decision: Relationship types 明確區分（`METRO_LINK`, `RAIL_LINK`, `INTERCHANGE_TO`），全部雙向儲存。 Why: 雙向儲存讓 Dijkstra 不需要 undirected pattern（Neo4j 中較慢）；區分類型支援過濾單一路網。
