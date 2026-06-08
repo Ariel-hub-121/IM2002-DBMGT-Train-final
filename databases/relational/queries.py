@@ -1333,8 +1333,8 @@ def register_user(
     """
     import uuid
 
-    # Generate a unique user ID using the first 8 hex chars of a UUID
-    user_id = "RU-" + uuid.uuid4().hex[:8].upper()
+    # Generate a standard UUID string compatible with the UUID PK column in users.
+    user_id = str(uuid.uuid4())
     # Combine first and last name into a single full name string
     full_name = f"{first_name} {surname}"
     # Only year is provided, so default to Jan 1 of that year
