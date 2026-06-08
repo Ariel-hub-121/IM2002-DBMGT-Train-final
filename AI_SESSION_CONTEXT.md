@@ -1344,6 +1344,27 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: 工具定義前加兩行英文 comment，說明 `queries.py` 採兩段式查詢（先查 `national_rail_booking_id`，查無再查 `metro_trip_id`），一個工具即可處理 BK… 與 MT… 兩種 ID，不依賴前綴假設。Why: 這是非直觀的設計，未來讀者容易誤以為應各網拆成獨立工具。
   - Decision: `_execute_tool` 中 `query_payment_info` 回傳 `None` 時，替換為 `{"error": "No payment record found for <id>"}` 再序列化，並在該行加上原因 comment。Why: `json.dumps(None)` 產生字串 `"null"`，LLM 無法區分「查無資料」與「欄位缺失」，無法向使用者給出有意義的錯誤訊息。
   - Decision: `get_payment_info` 分支改為先從 `params` 嘗試四個候選 key（`booking_id` → `query` → `id` → `booking_reference`），取到第一個非空值再呼叫 `query_payment_info(booking_id)`。Why: 實測發現 LLM 有時傳入 `query` 而非 `booking_id`，用 `**params` 展開會導致 `TypeError`；容錯 key 對應覆蓋已知的偏差命名，不依賴 LLM 每次傳對欄位名稱。
+- [x] `queries.py` ID 轉換層（feature/quries_PK，2026-06-08）：
+  > ⚠️ **此批修改為配合 feature/schema_PK PK 遷移的查詢層補完**。原 queries.py 直接將 agent 傳入的業務字串當成 DB PK 傳給 SQL，PK 型別遷移為 INT/UUID 後，所有查詢均在 PostgreSQL 端報 type mismatch 錯誤。
+
+  **新增 ID 轉換 helpers**
+  - Decision: 加入 `_SEED_NAMESPACE`、`_business_uuid(id)`、`_ensure_uuid(id)`，使用與 `seed_postgres.py` 相同的 namespace（`f47ac10b-…`）。Why: 查詢層必須能將業務字串（`"BK001"`、`"U001"`）轉為與 seeder 相同的 deterministic UUID；`_ensure_uuid` 以 try/except 兼容「已是 UUID」與「業務字串」兩種輸入。
+  - Decision: 加入 `_METRO_STATION_INDEX` / `_RAIL_STATION_INDEX`（與 agent.py 的 `_STATION_INDEX` 互為鏡像），及 `_metro_station_db_id(cur, json_id)` / `_rail_station_db_id(cur, json_id)` helpers，以站名查 `station_id(INT)`。Why: 站點 PK 為 SERIAL INT，schema 無 business_id 欄位；helper 在同一 cursor 上執行，不需另開連線。
+  - Decision: 加入 `_metro_schedule_db_id(cur, json_id)` / `_rail_schedule_db_id(cur, json_id)`，均以 `WHERE json_id = %s` 查詢。Why: schedule PK 為 SERIAL INT，已在 `json_id` 欄位保留原業務字串；直接反查，不需維護 hardcoded (line, direction) → INT 對照表。
+
+  **read-only 查詢函式修正**
+  - Decision: `query_national_rail_availability` 與 `query_metro_schedules` 的 SELECT 改為 `json_id AS schedule_id`。Why: agent 收到後可能再將 `schedule_id` 傳入 `query_national_rail_fare`、`query_available_seats`、`execute_booking`；若回傳 INT 而非 json_id 字串，後續函式的 json_id 反查就會失效。
+  - Decision: 兩函式的站點 ID 參數改為在 `with _connect()` 區塊內先呼叫 `_*_station_db_id(cur, id)` 解析為 INT 再填入 params。Why: 解析與查詢共用同一 cursor，不需另開連線；放在連線區塊內才能安全共用。
+  - Decision: `query_national_rail_fare`、`query_metro_fare`、`query_available_seats`、`query_payment_info` 均在進入 SQL 前先呼叫對應 helper 完成 ID 轉換。Why: 函式簽名保持不變（仍接受業務字串），轉換封裝在函式內，agent 無需感知 DB PK 型別。
+
+  **write 操作函式修正**
+  - Decision: `execute_booking` 移除 `_gen_booking_id()` / `_gen_payment_id()`，改以 `str(uuid.uuid4())` 生成 `booking_uuid` / `payment_uuid`；所有 SQL FK 欄位一律傳 DB INT 或 UUID。回傳的 `booking_dict["schedule_id"]` 仍保留原始 json_id 字串供 agent 顯示。Why: schema PK 型別為 UUID，原 `"BK-XXXXXXXX"` VARCHAR 格式 INSERT 會被 PostgreSQL 拒絕。
+  - Decision: `execute_booking` 第 0 步先解析所有外部 ID（`user_uuid`、`schedule_db_id`、`origin_db_id`、`dest_db_id`），後續 SQL 均使用解析後的值。Why: 進 transaction 前解析，ID 查無資料時可 early return (False, error)，不帶錯誤 ID 進入 INSERT 流程。
+  - Decision: `execute_cancellation` 開連線前先 `_ensure_uuid(booking_id)` 與 `_ensure_uuid(user_id)`，後續 UPDATE 均使用 UUID。Why: agent 可能傳入「execute_booking 回傳的 UUID」或「seeder 的業務字串（BK001）」；`_ensure_uuid` 相容兩種格式。
+
+  **register_user 修正**
+  - Decision: `register_user` 的 `user_id` 從 `"RU-" + uuid.uuid4().hex[:8].upper()` 改為 `str(uuid.uuid4())`。Why: `users.user_id` PK 型別為 UUID；`"RU-XXXXXXXX"` 格式不符 PostgreSQL UUID 語法，INSERT 永遠拋出 `invalid input syntax for type uuid`；改後回傳格式也與 `login_user` 一致。
+
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 ## Prompts That Worked
