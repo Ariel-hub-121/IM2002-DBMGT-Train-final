@@ -59,6 +59,73 @@ def _gen_payment_id() -> str:
     return "PY-" + uuid.uuid4().hex[:8].upper()
 
 
+# ── ID-conversion helpers ─────────────────────────────────────────────────────
+# The agent passes human-facing string IDs ("NR01", "MS_SCH01", "U001", "BK001").
+# The DB uses SERIAL INT for stations/schedules and UUID for users/orders/payments.
+# These helpers translate between the two representations.
+
+_SEED_NAMESPACE = uuid.UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+
+def _business_uuid(business_id: str) -> str:
+    """Deterministic UUID matching seed_postgres.py's business_uuid()."""
+    return str(uuid.uuid5(_SEED_NAMESPACE, business_id))
+
+def _ensure_uuid(id_str: str) -> str:
+    """Return id_str if already a valid UUID; otherwise derive via _business_uuid."""
+    try:
+        uuid.UUID(id_str)
+        return id_str
+    except ValueError:
+        return _business_uuid(id_str)
+
+_METRO_STATION_INDEX: dict[str, str] = {
+    "MS01": "Central Square", "MS02": "Riverside",    "MS03": "Northgate",
+    "MS04": "Elm Park",       "MS05": "Westfield",    "MS06": "Harbour View",
+    "MS07": "Old Town",       "MS08": "University",   "MS09": "Queensbridge",
+    "MS10": "Parkside",       "MS11": "Greenhill",    "MS12": "Lakeshore",
+    "MS13": "Clifton",        "MS14": "Eastwick",     "MS15": "Ferndale",
+    "MS16": "Hilltop",        "MS17": "Broadmoor",    "MS18": "Sunnyvale",
+    "MS19": "Redwood",        "MS20": "Thornton",
+}
+_RAIL_STATION_INDEX: dict[str, str] = {
+    "NR01": "Central Station",   "NR02": "Maplewood",
+    "NR03": "Old Town Junction", "NR04": "Ashford",
+    "NR05": "Stonehaven",        "NR06": "Bridgeport",
+    "NR07": "Ferndale Halt",     "NR08": "Coalport",
+    "NR09": "Dunmore",           "NR10": "Langford End",
+}
+
+def _metro_station_db_id(cur, station_json_id: str) -> int:
+    name = _METRO_STATION_INDEX[station_json_id]
+    cur.execute("SELECT station_id FROM metro_stations WHERE name = %s", (name,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Metro station not found: {station_json_id} ({name})")
+    return row["station_id"]
+
+def _rail_station_db_id(cur, station_json_id: str) -> int:
+    name = _RAIL_STATION_INDEX[station_json_id]
+    cur.execute("SELECT station_id FROM national_rail_stations WHERE name = %s", (name,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Rail station not found: {station_json_id} ({name})")
+    return row["station_id"]
+
+def _metro_schedule_db_id(cur, schedule_json_id: str) -> int:
+    cur.execute("SELECT schedule_id FROM metro_schedules WHERE json_id = %s", (schedule_json_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Metro schedule not found: {schedule_json_id}")
+    return row["schedule_id"]
+
+def _rail_schedule_db_id(cur, schedule_json_id: str) -> int:
+    cur.execute("SELECT schedule_id FROM national_rail_schedules WHERE json_id = %s", (schedule_json_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Rail schedule not found: {schedule_json_id}")
+    return row["schedule_id"]
+
+
 # ── Example ───────────────────────────────────────────────────────────────────
 # The block below shows the query pattern: open a cursor, run SQL, return rows.
 # Use _connect() for read-only queries; for write operations use a manual
@@ -230,7 +297,7 @@ def query_national_rail_availability(
         )
 
         SELECT
-            nrs.schedule_id,
+            nrs.json_id       AS schedule_id,
             nrs.line_name,
             nrs.service_type,
             nrs.direction,
@@ -272,28 +339,29 @@ def query_national_rail_availability(
         ORDER BY nrs.line_name, nrs.schedule_id;
     """
 
-    # Build the parameter list in the same order as the %s placeholders above.
-    # Placeholders in order:
-    #   1. stop_origin WHERE station_id = %s
-    #   2. stop_dest   WHERE station_id = %s
-    #   3. bookings_per_departure WHERE travel_date = %s::date  (NULL-safe)
-    #   4. origin_stn  JOIN station_id = %s
-    #   5. dest_stn    JOIN station_id = %s
-    #   6. (optional)  day_filter_clause %s::date
-    params = [
-        origin_id,       # 1. stop_origin WHERE station_id = %s
-        destination_id,  # 2. stop_dest   WHERE station_id = %s
-        travel_date,     # 3. bookings_per_departure WHERE travel_date = %s::date
-        origin_id,       # 4. origin station name JOIN
-        destination_id,  # 5. destination station name JOIN
-    ]
-
-    if travel_date:
-        # 6. The day-of-week filter needs travel_date a second time.
-        params.append(travel_date)
-
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Resolve "NR01"-style IDs to the DB SERIAL INT PKs used in all FK columns.
+            origin_db_id = _rail_station_db_id(cur, origin_id)
+            dest_db_id   = _rail_station_db_id(cur, destination_id)
+
+            # Placeholders in order:
+            #   1. stop_origin WHERE station_id = %s
+            #   2. stop_dest   WHERE station_id = %s
+            #   3. bookings_per_departure WHERE travel_date = %s::date
+            #   4. origin_stn  JOIN station_id = %s
+            #   5. dest_stn    JOIN station_id = %s
+            #   6. (optional)  day_filter_clause %s::date
+            params = [
+                origin_db_id,    # 1
+                dest_db_id,      # 2
+                travel_date,     # 3
+                origin_db_id,    # 4
+                dest_db_id,      # 5
+            ]
+            if travel_date:
+                params.append(travel_date)  # 6
+
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
 
@@ -347,15 +415,12 @@ def query_national_rail_fare(
           AND fare_class  = %s;
     """
 
-    # Parameters in placeholder order:
-    #   1. %s  → stops_travelled (used in the arithmetic expression)
-    #   2. %s  → schedule_id
-    #   3. %s  → fare_class
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (stops_travelled, schedule_id, fare_class))
+            # Resolve json_id ("NR1_SCH_01") → INT PK used in the fares FK.
+            schedule_db_id = _rail_schedule_db_id(cur, schedule_id)
+            cur.execute(sql, (stops_travelled, schedule_db_id, fare_class))
             row = cur.fetchone()
-            # fetchone() returns None when no matching fare row exists.
             return dict(row) if row else None
 
 # ── METRO SCHEDULES & FARE ────────────────────────────────────────────────────
@@ -447,7 +512,7 @@ def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
         )
 
         SELECT
-            ms.schedule_id,
+            ms.json_id        AS schedule_id,
             ms.line_name,
             ms.direction,
             ms.first_train_time,
@@ -474,14 +539,12 @@ def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
         ORDER BY ms.line_name, ms.schedule_id;
     """
 
-    # Parameters in placeholder order:
-    #   1. %s → stop_origin WHERE station_id = %s
-    #   2. %s → stop_dest   WHERE station_id = %s
-    #   3. %s → origin_stn  JOIN station_id  = %s  (for name lookup)
-    #   4. %s → dest_stn    JOIN station_id  = %s  (for name lookup)
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (origin_id, destination_id, origin_id, destination_id))
+            # Resolve "MS01"-style IDs to the DB SERIAL INT PKs used in all FK columns.
+            origin_db_id = _metro_station_db_id(cur, origin_id)
+            dest_db_id   = _metro_station_db_id(cur, destination_id)
+            cur.execute(sql, (origin_db_id, dest_db_id, origin_db_id, dest_db_id))
             return [dict(row) for row in cur.fetchall()]
 
 def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
@@ -523,14 +586,12 @@ def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
         WHERE schedule_id = %s;
     """
 
-    # Parameters in placeholder order:
-    #   1. %s → stops_travelled (used in the arithmetic expression)
-    #   2. %s → schedule_id
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (stops_travelled, schedule_id))
+            # Resolve json_id ("MS_SCH01") → INT PK used in the schedules table.
+            schedule_db_id = _metro_schedule_db_id(cur, schedule_id)
+            cur.execute(sql, (stops_travelled, schedule_db_id))
             row = cur.fetchone()
-            # fetchone() returns None when the schedule_id does not exist.
             return dict(row) if row else None
 
 # ── SEAT SELECTION ────────────────────────────────────────────────────────────
@@ -557,6 +618,8 @@ def query_available_seats(
     """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Resolve json_id → INT PK used in seat layout and booking_tickets FKs.
+            schedule_db_id = _rail_schedule_db_id(cur, schedule_id)
             cur.execute(
                 """
                 SELECT
@@ -580,7 +643,7 @@ def query_available_seats(
                   )
                 ORDER BY c.coach_name, s.seat_row, s.seat_column
                 """,
-                (schedule_id, fare_class, schedule_id, travel_date, departure_time, departure_time),
+                (schedule_db_id, fare_class, schedule_db_id, travel_date, departure_time, departure_time),
             )
             return [dict(row) for row in cur.fetchall()]
 
@@ -809,9 +872,11 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
         source_type, national_rail_booking_id, metro_trip_id;
         or None if no payment record is found.
     """
+    # Convert business IDs ("BK001", "MT001") to their deterministic UUIDs.
+    booking_uuid = _ensure_uuid(booking_id)
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Step 1: try national rail booking
+            # Step 1: try national rail booking UUID
             cur.execute(
                 """
                 SELECT p.payment_id, p.amount_usd, p.method, p.status, p.paid_at,
@@ -820,11 +885,11 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
                 JOIN payment_sources ps ON ps.payment_id = p.payment_id
                 WHERE ps.national_rail_booking_id = %s
                 """,
-                (booking_id,),
+                (booking_uuid,),
             )
             row = cur.fetchone()
 
-            # Step 2: fall back to metro purchase if not found above
+            # Step 2: fall back to metro purchase UUID
             if row is None:
                 cur.execute(
                     """
@@ -834,7 +899,7 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
                     JOIN payment_sources ps ON ps.payment_id = p.payment_id
                     WHERE ps.metro_trip_id = %s
                     """,
-                    (booking_id,),
+                    (booking_uuid,),
                 )
                 row = cur.fetchone()
 
@@ -871,13 +936,19 @@ def execute_booking(
         (True, booking_dict)   on success
         (False, error_message) on failure
     """
-    # Open a manual-commit connection so booking + payment are atomic
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
 
-            # ── 1. Look up the schedule to get departure time and service type ──
+            # ── 0. Resolve external IDs to DB-internal types ──
+            # user_id may be a UUID (from login) or a business ID ("U001"); handle both.
+            user_uuid      = _ensure_uuid(user_id)
+            schedule_db_id = _rail_schedule_db_id(cur, schedule_id)
+            origin_db_id   = _rail_station_db_id(cur, origin_station_id)
+            dest_db_id     = _rail_station_db_id(cur, destination_station_id)
+
+            # ── 1. Look up schedule metadata and fare parameters ──
             cur.execute(
                 """
                 SELECT s.first_train_time, s.service_type,
@@ -887,7 +958,7 @@ def execute_booking(
                   ON f.schedule_id = s.schedule_id AND f.fare_class = %s
                 WHERE s.schedule_id = %s
                 """,
-                (fare_class, schedule_id),
+                (fare_class, schedule_db_id),
             )
             schedule = cur.fetchone()
             if not schedule:
@@ -896,19 +967,18 @@ def execute_booking(
             if departure_time is None:
                 departure_time = schedule["first_train_time"]
 
-           # ── 2. Count stops between origin and destination ──
-            # First get the stop_order of both endpoints
+            # ── 2. Count stops between origin and destination ──
             cur.execute(
                 """
                 SELECT station_id, stop_order
                 FROM national_rail_schedule_stops
-                WHERE schedule_id = %s
-                AND station_id IN (%s, %s)
-                AND is_stop = TRUE
-                AND effective_to IS NULL
+                WHERE schedule_id  = %s
+                  AND station_id  IN (%s, %s)
+                  AND is_stop      = TRUE
+                  AND effective_to IS NULL
                 ORDER BY stop_order
                 """,
-                (schedule_id, origin_station_id, destination_station_id),
+                (schedule_db_id, origin_db_id, dest_db_id),
             )
             stop_rows = cur.fetchall()
             if len(stop_rows) != 2:
@@ -918,33 +988,27 @@ def execute_booking(
             dest_order   = stop_rows[1]["stop_order"]
             lo, hi       = min(origin_order, dest_order), max(origin_order, dest_order)
 
-            # Count only is_stop=TRUE stations between the two endpoints (exclusive of origin,
-            # inclusive of dest) — matches the stops_travelled definition used in fare queries.
-            # stop_order difference would overcount on express services that pass through
-            # non-stopping stations.
             cur.execute(
                 """
                 SELECT COUNT(*) AS stops_travelled
                 FROM national_rail_schedule_stops
                 WHERE schedule_id  = %s
-                AND is_stop      = TRUE
-                AND effective_to IS NULL
-                AND stop_order   > %s
-                AND stop_order  <= %s
+                  AND is_stop      = TRUE
+                  AND effective_to IS NULL
+                  AND stop_order   > %s
+                  AND stop_order  <= %s
                 """,
-                (schedule_id, lo, hi),
+                (schedule_db_id, lo, hi),
             )
             stops_travelled = cur.fetchone()["stops_travelled"]
-            # ── 3. Calculate fare ──
-            # Keep psycopg2's Decimal return type throughout to avoid floating-point errors.
-            # Decimal(stops_travelled) ensures multiplication stays in the Decimal domain.
-            base_fare     = schedule["base_fare_usd"]        # Decimal
-            per_stop_rate = schedule["per_stop_rate_usd"]    # Decimal
+
+            # ── 3. Calculate fare (keep Decimal throughout to avoid float rounding) ──
+            base_fare     = schedule["base_fare_usd"]
+            per_stop_rate = schedule["per_stop_rate_usd"]
             total_fare    = base_fare + per_stop_rate * Decimal(stops_travelled)
 
-            # ── 4. Resolve seat: look up seat_pk from seat_code ──
+            # ── 4. Resolve seat via seat_code → seat_pk ──
             if seat_id.lower() == "any":
-                # Auto-assign: pick first available seat in the correct fare class coach
                 cur.execute(
                     """
                     SELECT ns.seat_pk, ns.seat_code, nc.coach_name
@@ -952,7 +1016,7 @@ def execute_booking(
                     JOIN national_rail_coaches nc ON nc.coach_id = ns.coach_id
                     JOIN national_rail_seat_layouts nl ON nl.layout_id = nc.layout_id
                     WHERE nl.schedule_id = %s
-                      AND nc.fare_class = %s
+                      AND nc.fare_class  = %s
                       AND ns.seat_pk NOT IN (
                           SELECT bt.seat_pk FROM booking_tickets bt
                           WHERE bt.schedule_id    = %s
@@ -963,7 +1027,7 @@ def execute_booking(
                       )
                     LIMIT 1
                     """,
-                    (schedule_id, fare_class, schedule_id, travel_date, departure_time),
+                    (schedule_db_id, fare_class, schedule_db_id, travel_date, departure_time),
                 )
                 seat_row = cur.fetchone()
                 if not seat_row:
@@ -972,7 +1036,6 @@ def execute_booking(
                 seat_code = seat_row["seat_code"]
                 coach     = seat_row["coach_name"]
             else:
-                # Use the requested seat_id (seat_code)
                 cur.execute(
                     """
                     SELECT ns.seat_pk, ns.seat_code, nc.coach_name
@@ -980,10 +1043,10 @@ def execute_booking(
                     JOIN national_rail_coaches nc ON nc.coach_id = ns.coach_id
                     JOIN national_rail_seat_layouts nl ON nl.layout_id = nc.layout_id
                     WHERE nl.schedule_id = %s
-                      AND nc.fare_class = %s
-                      AND ns.seat_code = %s
+                      AND nc.fare_class  = %s
+                      AND ns.seat_code   = %s
                     """,
-                    (schedule_id, fare_class, seat_id),
+                    (schedule_db_id, fare_class, seat_id),
                 )
                 seat_row = cur.fetchone()
                 if not seat_row:
@@ -992,7 +1055,6 @@ def execute_booking(
                 seat_code = seat_row["seat_code"]
                 coach     = seat_row["coach_name"]
 
-                # Confirm the seat is not already taken on this departure
                 cur.execute(
                     """
                     SELECT 1 FROM booking_tickets
@@ -1002,33 +1064,31 @@ def execute_booking(
                       AND seat_pk        = %s
                       AND status        != 'cancelled'
                     """,
-                    (schedule_id, travel_date, departure_time, seat_pk),
+                    (schedule_db_id, travel_date, departure_time, seat_pk),
                 )
                 if cur.fetchone():
                     return (False, f"Seat {seat_id} is already booked for {travel_date}")
 
-            # ── 5. Generate IDs ──
-            booking_id = _gen_booking_id()
-            payment_id = _gen_payment_id()
+            # ── 5. Generate UUID PKs (schema requires UUID for orders and payments) ──
+            booking_uuid = str(uuid.uuid4())
+            payment_uuid = str(uuid.uuid4())
 
             # ── 6. Insert travel_orders ──
-            # FIX BUG-1: all values bound via %s — no inline literals in SQL string
             cur.execute(
                 """
                 INSERT INTO travel_orders (order_id, user_id, order_type, amount_usd, status)
                 VALUES (%s, %s, %s, %s, %s)
                 """,
-                (booking_id, user_id, "national_rail", round(total_fare, 2), "confirmed"),
+                (booking_uuid, user_uuid, "national_rail", round(total_fare, 2), "confirmed"),
             )
 
             # ── 7. Insert bookings header ──
             cur.execute(
                 "INSERT INTO bookings (booking_id) VALUES (%s)",
-                (booking_id,),
+                (booking_uuid,),
             )
 
-            # ── 8. Insert booking_tickets ──
-            # status bound via %s so it is consistent with step 6 above
+            # ── 8. Insert booking_tickets using DB INT FKs for schedule and stations ──
             leg = "single" if ticket_type == "single" else "outbound"
             cur.execute(
                 """
@@ -1039,35 +1099,35 @@ def execute_booking(
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    booking_id, schedule_id, origin_station_id, destination_station_id,
+                    booking_uuid, schedule_db_id, origin_db_id, dest_db_id,
                     seat_pk, travel_date, departure_time, ticket_type, fare_class,
                     coach, seat_code, stops_travelled, leg, "confirmed",
                 ),
             )
 
-            # ── 9. Insert payment — must be in the same commit as the booking ──
+            # ── 9. Insert payment records in the same transaction ──
             cur.execute(
                 """
                 INSERT INTO payments (payment_id, amount_usd, method, status, paid_at)
                 VALUES (%s, %s, %s, %s, NOW())
                 """,
-                (payment_id, round(total_fare, 2), "credit_card", "paid"),
+                (payment_uuid, round(total_fare, 2), "credit_card", "paid"),
             )
             cur.execute(
                 """
                 INSERT INTO payment_sources (payment_id, source_type, national_rail_booking_id)
                 VALUES (%s, %s, %s)
                 """,
-                (payment_id, "national_rail_booking", booking_id),
+                (payment_uuid, "national_rail_booking", booking_uuid),
             )
 
         # Single commit covers all inserts — atomicity requirement met
         conn.commit()
 
         booking_dict = {
-            "booking_id":              booking_id,
-            "user_id":                 user_id,
-            "schedule_id":             schedule_id,
+            "booking_id":              booking_uuid,
+            "user_id":                 user_uuid,
+            "schedule_id":             schedule_id,         # return the json_id form
             "origin_station_id":       origin_station_id,
             "destination_station_id":  destination_station_id,
             "travel_date":             travel_date,
@@ -1077,9 +1137,8 @@ def execute_booking(
             "seat_code":               seat_code,
             "coach":                   coach,
             "stops_travelled":         stops_travelled,
-            # Convert to float only at the final output boundary for JSON serialisation
             "amount_usd":              float(round(total_fare, 2)),
-            "payment_id":              payment_id,
+            "payment_id":              payment_uuid,
         }
         return (True, booking_dict)
 
@@ -1107,6 +1166,10 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
         (True, result_dict)  with refund_amount_usd and policy note
         (False, error_msg)
     """
+    # Accept both UUID strings (from execute_booking) and business IDs ("BK001").
+    booking_uuid = _ensure_uuid(booking_id)
+    user_uuid    = _ensure_uuid(user_id)
+
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
@@ -1127,7 +1190,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 AND bt.leg      != 'inbound'
                 LIMIT 1
                 """,
-                (booking_id, user_id),
+                (booking_uuid, user_uuid),
             )
             order = cur.fetchone()
             if not order:
@@ -1147,7 +1210,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 ORDER BY bt.travel_date ASC, bt.departure_time ASC
                 LIMIT 1
                 """,
-                (booking_id,),
+                (booking_uuid,),
             )
             ticket = cur.fetchone()
             if not ticket:
@@ -1213,13 +1276,13 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 WHERE booking_id = %s
                   AND status     = 'confirmed'
                 """,
-                (booking_id,),
+                (booking_uuid,),
             )
 
             # ── 5. Update the parent order status ──
             cur.execute(
                 "UPDATE travel_orders SET status = 'cancelled' WHERE order_id = %s",
-                (booking_id,),
+                (booking_uuid,),
             )
 
             # ── 6. Mark the payment as refunded ──
@@ -1231,13 +1294,13 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 WHERE ps.payment_id               = p.payment_id
                   AND ps.national_rail_booking_id = %s
                 """,
-                (booking_id,),
+                (booking_uuid,),
             )
 
         conn.commit()
 
         return (True, {
-            "booking_id":        booking_id,
+            "booking_id":        booking_uuid,
             "status":            "cancelled",
             # Convert to float only at the final output boundary for JSON serialisation
             "refund_amount_usd": float(refund_amount),
