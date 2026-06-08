@@ -1282,6 +1282,36 @@ def query_station_connections(station_id: str) -> list[dict]: ...
   - Decision: `customer_feedback` 不含 `user_id` 欄位，需要時透過 JOIN `travel_orders` 取得。`feedback_comments` 獨立為 1:1 子表，只在來源 JSON 的 `comment` 非 `NULL` 時插入。Why: 避免 `user_id` 在兩表重複儲存造成不一致；comment 獨立存放讓純評分聚合查詢不需掃描 TEXT 欄位。
   **密碼 Argon2id hash；重跑 seeder 只處理新使用者**
   - Decision: `user_security` 以 Argon2id hash 儲存密碼與密保答案。重跑 seeder 時先查詢已存在的 `user_id`，只對新使用者執行 hash，已有記錄的跳過。Why: Argon2id 刻意設計為耗時（防暴力破解）；若每次全部重新 hash 會讓 seeder 重跑過慢；mock data 密碼在執行間不變，跳過安全。
+- [x] `seed_postgres.py` 全面改寫以對應 Schema PK 遷移（三人共同完成，使用同一台電腦，2026-06-08）：
+  > ⚠️ **此次改寫為配合 feature/schema_PK 的 PK 遷移決策**，原 seeder 直接傳入 VARCHAR business ID 作為 PK 的寫法全面作廢，已替換為下列新策略。
+
+  **函式簽名與 mapping 傳遞**
+  - Decision: 所有 `seed_*` 函式改為**接受並回傳 mapping dict**（如 `metro_station_map`、`rail_schedule_map`），由 `main()` 依序協調傳遞。Why: 多個函式需要共用相同的「JSON business ID → DB 生成 PK」對應表（例如 `seed_national_rail_bookings` 需要 `user_map`、`rail_schedule_map`、`rail_station_map`、`seat_pk_map`）；透過參數傳遞比全域變數更明確且易測試。
+  - Decision: `main()` 的呼叫順序更新為：`metro_station_map = seed_metro_stations(cur)` → `rail_station_map = seed_national_rail_stations(cur, metro_station_map)` → ... → `seed_feedback(cur, booking_map, purchase_map)`。Why: 後呼叫的函式依賴先呼叫函式的回傳值；顯式傳遞比隱式依賴順序更容易追蹤。
+
+  **SERIAL PK 表的 idempotency 策略（站點、時刻表、客服回饋）**
+  - Decision: 無業務唯一鍵的 SERIAL PK 表（`metro_stations`、`national_rail_stations`、`metro_schedules`、`national_rail_schedules`）採用**「SELECT 現有 → 只 INSERT 缺少的 → SELECT 全部建 mapping」**三步驟。Why: 這些表的 schema 沒有獨立的 `business_id` 欄位，無法用 `ON CONFLICT (business_id) DO NOTHING`；名稱（`name`）和組合鍵（`line_name, direction`）在 mock data 中事實唯一，可作為 proxy key 進行去重。
+  - Decision: `metro_stations` / `national_rail_stations` 使用 `name` 作為 proxy key；`metro_schedules` 使用 `(line_name, direction)`；`national_rail_schedules` 使用 `(line_name, direction, service_type)`。Why: 這些組合在各自的 mock data 中保證唯一；`service_type` 加入國鐵時刻表 key，因同一路線可能同時有 normal 與 express 兩種班次。
+  - Decision: `national_rail_seat_layouts` 使用 `ON CONFLICT (schedule_id) DO NOTHING`（schema 已有 `UNIQUE(schedule_id)`）。Why: FK schedule_id（INT）本身即為業務唯一鍵，不需要額外 proxy。
+  - Decision: `customer_feedback` 使用 `ON CONFLICT (order_id) DO NOTHING`（schema 已有 `UNIQUE(order_id)`）。Why: 同上，UUID FK 即為業務唯一鍵；`feedback_comments` 的 INT PK 透過 SELECT 查回 `feedback_id`，再用 `insert_many`（`ON CONFLICT DO NOTHING`）插入。
+
+  **UUID PK 表的 idempotency 策略（user / orders / payments）**
+  - Decision: UUID PK 表（`users`、`travel_orders`、`bookings`、`metro_trip_purchases`、`metro_day_pass_trips`、`payments`、`payment_sources`）採用 **`uuid.uuid5(_SEED_NAMESPACE, business_id)`** 產生確定性 UUID，**顯式傳入 INSERT**，並搭配 `ON CONFLICT (pk) DO NOTHING`。Why: UUID `DEFAULT gen_random_uuid()` 每次產生不同值；若不傳入固定 UUID，重跑 seeder 時同一筆業務資料會累積多列重複記錄；`uuid5 + 固定 namespace` 保證相同 business_id 每次產生相同 UUID，讓 PK 衝突偵測有效運作。固定 namespace 為 `f47ac10b-58cc-4372-a567-0e02b2c3d479`。
+  - Decision: `user_map`（`"RU01"` → UUID string）、`booking_map`（`"BK001"` → UUID）、`purchase_map`（`"MT001"` → UUID）、`payment_map`（`"PM001"` → UUID）均為確定性對應，不需要 SELECT 回查，直接由 Python 計算建立。Why: `uuid5` 的輸出是純函式，不依賴 DB 狀態，避免一次 SELECT 的往返成本。
+  - Decision: `user_security` 的重跑去重改為比對 **UUID 字串**（`WHERE user_id = ANY(%s)`，傳入 uuid string list），而非原本的 VARCHAR business ID。Why: DB 中 `user_security.user_id` 型別為 UUID；psycopg2 以 `::text` cast 取回字串後與 Python uuid string 比對。
+
+  **所有 FK 欄位全面改為 INT / UUID 查表**
+  - Decision: 原先直接插入 VARCHAR business ID 的 FK 欄位（如 `schedule_id`、`station_id`、`layout_id`），全部改為透過 mapping dict 轉換為 DB 生成的 INT PK 後再插入。Why: schema PK 遷移後，FK 欄位型別已從 VARCHAR 改為 INT 或 UUID，直接插入字串會被 PostgreSQL 型別系統拒絕。
+  - Decision: `seat_pk_map` 的 key 由原本的 `(VARCHAR schedule_id, coach_name, seat_code)` 改為 `(INT schedule_id, coach_name, seat_code)`。Why: 三表 JOIN 查回的 `sl.schedule_id` 已是 DB INT；`booking_tickets` seeder 以 `rail_schedule_map[b["schedule_id"]]` 轉換後 lookup，型別一致。
+  - Decision: `seed_metro_travels` 中的 stop 一致性驗證，改為先將 JSON stop set 中的 string key 通過 `metro_schedule_map` / `metro_station_map` 轉為 INT，再與 DB `metro_schedule_stops` 中的 INT 欄位比對。Why: 遷移後 DB 儲存 INT，直接比對 string set 會永遠不一致。
+
+- [x] `json_id` 欄位補充：保留 schedule JSON 業務字串（schema + seeder，2026-06-08）：
+  **問題根源**
+  - Decision: 在 `metro_schedules` 與 `national_rail_schedules` 各加入 `"json_id" VARCHAR(50) UNIQUE`（可 NULL，緊接在 SERIAL PK 之後）。Why: SERIAL 遷移後 DB 只剩自動產生的整數 PK，原始 JSON 的業務字串（如 `"MS_SCH01"`、`"NR_SCH01"`）已無欄位保存。Agent 收到使用者查詢後傳入 schedule 字串，若 DB 中找不到此字串則無法查詢；`json_id` 作為「業務 ID 保留欄」解決此斷鏈問題。
+  - Decision: `seed_metro_schedules` 與 `seed_national_rail_schedules` 的 INSERT 欄位列表加入 `json_id`，值為 `s["schedule_id"]`（即 JSON 原始字串）。Why: 欄位加入 schema 後，seeder 必須同步填值，否則 `json_id` 永遠為 NULL，等同沒有加。
+  - Decision: `json_id` 宣告為 `UNIQUE` 而非 `NOT NULL`。Why: `UNIQUE` 防止同一業務 ID 被重複插入（idempotency 保護）；`NULL` 允許保留未來手動或程式建立的記錄不強制帶業務 ID。
+  - ⚠️ **查詢層注意**：`queries.py` 中凡接收 `schedule_id` 字串參數的函式，應改用 `WHERE json_id = %s` 取代原本的 `WHERE schedule_id = %s`，才能從 Agent 傳入的 `"MS_SCH01"` 對應到正確的 SERIAL 整數 PK。
+
 - [x] query_national_rail_availability — available_seats 計算方式 (2026-06-02):
   - Decision: `available_seats = total_seats - MAX(同一 departure_time 的訂座數)`，而非 `total_seats - 當天所有班次訂座加總`。 Why: 同一物理座位在不同 departure_time 可各自被訂（uq_booking_tickets_seat 的 unique key 包含 departure_time），若直接加總全天訂座量會超過 total_seats 產生負數。以最繁忙班次的訂座量為基準，得到的是保守但永遠非負的可用座位估計。
   - Decision: stops_travelled 計算：national rail 用 COUNT(is_stop=TRUE) 實際站數（不是 stop_order 差值）；metro 用 dest_stop_sequence - origin_stop_sequence。 Why: 快車在某些站是 pass-through（is_stop=FALSE），若用 stop_order 差值會把通過站也計費；metro 無 pass-through 概念故可直接用序列差。

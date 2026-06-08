@@ -226,6 +226,7 @@ COMMENT ON COLUMN "metro_rail_interchanges"."transfer_time_min" IS 'Walking time
 CREATE TABLE "metro_schedules" (
   -- SERIAL surrogate PK: internal lookup table; not exposed to users.
   "schedule_id"       SERIAL        PRIMARY KEY,
+  "json_id"           VARCHAR(50)   UNIQUE,
   "line_name"         VARCHAR(20)   NOT NULL,
   "direction"         VARCHAR(50)   NOT NULL,
   "origin_station_id" INT,
@@ -271,6 +272,7 @@ COMMENT ON TABLE "metro_schedule_operating_days" IS 'Operating days for each met
 CREATE TABLE "national_rail_schedules" (
   -- SERIAL surrogate PK: internal lookup table; not exposed to users.
   "schedule_id"            SERIAL      PRIMARY KEY,
+  "json_id"                VARCHAR(50) UNIQUE,
   "line_name"              VARCHAR(20) NOT NULL,
   -- service_type drives the refund policy applied at cancellation time:
   --   normal  → RF001 (standard refund window)
