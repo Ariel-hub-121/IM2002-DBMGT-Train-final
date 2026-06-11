@@ -537,7 +537,7 @@ def seed_users(cur):
     # expensive re-hashing on every re-run.
     all_uuids = list(user_map.values())
     cur.execute(
-        "SELECT user_id::text FROM user_security WHERE user_id = ANY(%s)",
+        "SELECT user_id::text FROM user_security WHERE user_id = ANY(%s::uuid[])",
         (all_uuids,),
     )
     existing_uuids = {row[0] for row in cur.fetchall()}
