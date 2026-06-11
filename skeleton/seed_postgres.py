@@ -617,7 +617,7 @@ def seed_national_rail_bookings(cur, user_map, rail_schedule_map, rail_station_m
     # booking_ids not yet present in booking_tickets.
     all_booking_uuids = list(booking_map.values())
     cur.execute(
-        "SELECT DISTINCT booking_id::text FROM booking_tickets WHERE booking_id = ANY(%s)",
+        "SELECT DISTINCT booking_id::text FROM booking_tickets WHERE booking_id = ANY(%s::uuid[])",
         (all_booking_uuids,),
     )
     existing_booking_uuids = {row[0] for row in cur.fetchall()}
@@ -925,7 +925,7 @@ def seed_feedback(cur, booking_map, purchase_map):
         order_uuids = [order_uuid(f["booking_id"]) for f in comment_data]
         cur.execute(
             "SELECT feedback_id, order_id::text FROM customer_feedback"
-            " WHERE order_id = ANY(%s)",
+            " WHERE order_id = ANY(%s::uuid[])",
             (order_uuids,),
         )
         order_to_feedback_id = {row[1]: row[0] for row in cur.fetchall()}
