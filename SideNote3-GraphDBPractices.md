@@ -291,8 +291,10 @@ Just as the relational `queries.py` stores SQL inline, the teaching graph code s
 The teaching code already avoids the biggest Cypher security risk: **Cypher injection**. Never format values directly into a Cypher string:
 
 ```python
+{% raw %}
 # DANGEROUS — never do this
 cypher = f"MATCH (s:MetroStation {{station_id: '{user_input}'}}) RETURN s"
+{% endraw %}
 
 # SAFE — always use parameters
 cypher = "MATCH (s:MetroStation {station_id: $station_id}) RETURN s"
