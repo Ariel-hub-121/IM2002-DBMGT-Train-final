@@ -325,15 +325,19 @@ PostgreSQL will immediately raise an `embedding dimension mismatch` error on any
 
 ---
 
-**Example 4**
+**Example 4 — Neo4j Seeding: RAIL_LINK Fare Column Design in `seed_neo4j.py`**
 
-> TODO: Add example 4 here. Include all three required fields: **Context**, **Prompt**, **Outcome**. If applicable, describe a case where the AI output was wrong and explain how it was identified and corrected.
+- **Context:** While implementing `_create_rail_links()` in `seed_neo4j.py`, I needed to decide which fare information to store on each `RAIL_LINK` relationship. National rail has two service types (normal/express) and two fare classes (standard/first), producing four combinations. Each combination has a `base_fare_usd` and a `per_stop_rate_usd` field, giving eight columns in total. I was unsure whether all eight columns genuinely needed to be stored on the edge.
+- **Prompt:** "My Neo4j RAIL_LINK relationship needs to store fare information. National rail has normal/express × standard/first, giving four combinations, each with base_fare_usd and per_stop_rate_usd. I have two options: (A) store all eight columns directly on the edge, or (B) store only the four base_fare columns on the edge and query PostgreSQL for per_stop_rate at query time. Please compare the tradeoffs of both approaches with query_cheapest_route in mind."
+- **Outcome:** The AI correctly identified the core tradeoff between the two options. Option A embeds all fare information entirely within the graph layer, allowing `query_cheapest_route` to complete its `reduce()` cost accumulation in a single Cypher query with no cross-database round trips. Option B saves graph storage space but requires an additional PostgreSQL lookup for `per_stop_rate` on every path query, introducing latency and making it impossible to compute the total fare inside a single Cypher statement. We adopted Option A, storing all eight fare columns on every `RAIL_LINK` edge. This decision is also documented in Design Document Section 6.1 Decision 6. The AI's analysis directly supported this design choice and required no correction.
 
 ---
 
-**Example 5**
+**Example 5 — Case Where AI Output Required Correction: `execute_cancellation` Refund Policy Verification**
 
-> TODO: Add example 5 here. Include all three required fields: **Context**, **Prompt**, **Outcome**. If applicable, describe a case where the AI output was wrong and explain how it was identified and corrected.
+- **Context:**  After completing the implementation of `execute_cancellation`, we asked the AI to verify whether the refund logic correctly matched the RF001 and RF002 policy specifications across all time windows and service types.
+- **Prompt:** We provided the full implementation and asked the AI to check each time window's refund percentage and administrative fee one by one against the policy specification, covering both normal and express service types.
+- **Outcome:** The AI eventually identified one real bug: the RF002 W1 branch (≥48 hours before departure, express service) was incorrectly deducting a $1.00 administrative fee, whereas the specification explicitly states that this window entitles the passenger to a full refund with no fee. However, the AI did not reach this conclusion directly — it initially misread the policy document and argued that the W1 window should charge a fee, which was the opposite of the correct answer. Only after we quoted the original specification text back to it did the AI revise its judgment and confirm the bug. We adopted the correction (setting `admin_fee = Decimal("0.00")` for RF002 W1) and added a code comment referencing the policy clause. This example illustrates that AI output must always be validated against the original source specification; the AI's initial confidence in an incorrect interpretation would have caused us to leave a real bug unfixed had we accepted its first response without question.
 
 ---
 
